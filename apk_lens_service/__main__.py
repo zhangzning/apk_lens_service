@@ -10,6 +10,7 @@ def main():
         factory=True,
         host=settings.host,
         port=settings.port,
+        uds=str(settings.listen_socket) if settings.listen_socket is not None else None,
         workers=1,
         timeout_graceful_shutdown=10,
     )

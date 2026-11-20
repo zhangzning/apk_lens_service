@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import errno
 import hashlib
 import hmac
 import mimetypes
@@ -13,14 +14,16 @@ from enum import StrEnum
 from pathlib import Path
 
 import anyio
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, Query, Request
 from starlette.requests import ClientDisconnect
 from starlette.responses import FileResponse, JSONResponse
 
 from apk_lens_service.utils import find_readelf
 from apk_lens_service.artifacts import AnalysisError, checked_files, encode_report, write_bundle
 from apk_lens_service.config import MAX_INLINE_ICON_BYTES, MIB, Profile, StaticAnalysisSettings
+from apk_lens_service.http_requests import apk_chunks, error, while_connected
 from apk_lens_service.supervisor import analyze_job
+from apk_lens_service.worker_proxy import SocketWorkers, WorkerJobResponse
 
 
 class OutputFormat(StrEnum):
@@ -64,10 +67,6 @@ class JobFileResponse(FileResponse):
             await self.cleanup()
 
 
-def error(status: int, code: str, message: str, *, headers=None) -> HTTPException:
-    return HTTPException(status, detail={"code": code, "message": message}, headers=headers)
-
-
 def authorize(request: Request, settings: StaticAnalysisSettings) -> None:
     token = settings.token.get_secret_value()
     if not token:
@@ -82,46 +81,15 @@ async def upload(request: Request, path: Path, filename: str, settings: StaticAn
     received = 0
     try:
         async with asyncio.timeout(settings.upload_timeout), await anyio.open_file(path, "wb") as target:
-            async for chunk in request.stream():
+            async for chunk in apk_chunks(
+                request, byte_limit=settings.max_apk_mib * MIB, timeout=settings.upload_timeout
+            ):
                 received += len(chunk)
-                if received > settings.max_apk_mib * MIB:
-                    raise error(413, "APK_SIZE_LIMIT", "上传的 APK 超过大小上限")
                 await target.write(chunk)
                 sha256.update(chunk)
     except TimeoutError as exc:
         raise error(408, "UPLOAD_TIMEOUT", "接收 APK 超时") from exc
-    if not received:
-        raise error(422, "INVALID_APK", "APK 内容为空")
     return {"filename": filename, "file_size": received, "sha256": sha256.hexdigest()}
-
-
-async def watch_disconnect(request: Request) -> None:
-    while (await request.receive())["type"] != "http.disconnect":
-        pass
-
-
-async def analyze_while_connected(
-    request: Request,
-    job_dir: Path,
-    profile: Profile,
-    settings: StaticAnalysisSettings,
-    *,
-    include_file_tree: bool,
-) -> dict:
-    analysis = asyncio.create_task(
-        analyze_job(job_dir, profile, settings, include_file_tree=include_file_tree)
-    )
-    disconnected = asyncio.create_task(watch_disconnect(request))
-    try:
-        done, _ = await asyncio.wait({analysis, disconnected}, return_when=asyncio.FIRST_COMPLETED)
-        if analysis in done:
-            return analysis.result()
-        raise ClientDisconnect()
-    finally:
-        for task in (analysis, disconnected):
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(analysis, disconnected, return_exceptions=True)
 
 
 def materialize(
@@ -156,10 +124,13 @@ def materialize(
     if len(data) > settings.max_result_mib * MIB:
         raise AnalysisError("RESULT_LIMIT", "解析报告超过大小上限")
     if output == OutputFormat.ZIP:
-        return write_bundle(
+        bundle = write_bundle(
             job_dir, data, roots,
             byte_limit=settings.max_result_mib * MIB, file_limit=settings.max_files,
         )
+        if bundle.stat().st_size > settings.max_result_mib * MIB:
+            raise AnalysisError("RESULT_LIMIT", "解析压缩包超过大小上限")
+        return bundle
     report_path = job_dir / "result.json"
     report_path.write_bytes(data)
     return report_path
@@ -168,6 +139,7 @@ def materialize(
 def create_app(settings: StaticAnalysisSettings | None = None) -> FastAPI:
     settings = settings or StaticAnalysisSettings()
     capacity = Capacity(settings)
+    workers = SocketWorkers(settings.worker_sockets) if settings.worker_sockets else None
     app = FastAPI(title="APK Lens Service", version="1.0")
 
     @app.get("/healthz")
@@ -176,25 +148,27 @@ def create_app(settings: StaticAnalysisSettings | None = None) -> FastAPI:
 
     @app.get("/readyz")
     async def ready():
-        writable = settings.work_dir.is_dir() and os.access(settings.work_dir, os.W_OK | os.X_OK)
-        java_available = (
-            os.access(Path(settings.java_home) / "bin/java", os.X_OK)
-            if settings.java_home else bool(shutil.which("java"))
-        )
-        return JSONResponse(
-            {
-                "ready": writable,
-                "jobs": {"active": capacity.active, "limit": settings.max_jobs},
-                "deep_jobs": {"active": capacity.deep, "limit": settings.max_deep_jobs},
-                "tools": {
-                    "aapt2": bool(shutil.which(settings.aapt2_bin)),
-                    "jadx": bool(shutil.which(settings.jadx_bin)),
-                    "java": java_available,
-                    "readelf": bool(find_readelf()),
-                },
-            },
-            status_code=200 if writable else 503,
-        )
+        details = {
+            "jobs": {"active": capacity.active, "limit": settings.max_jobs},
+            "deep_jobs": {"active": capacity.deep, "limit": settings.max_deep_jobs},
+        }
+        if workers is not None:
+            live, tools = await workers.status()
+            details["workers"] = {"ready": live, "configured": len(settings.worker_sockets)}
+            ok = live > 0
+        else:
+            ok = settings.work_dir.is_dir() and os.access(settings.work_dir, os.W_OK | os.X_OK)
+            tools = {
+                "aapt2": bool(shutil.which(settings.aapt2_bin)),
+                "jadx": bool(shutil.which(settings.jadx_bin)),
+                "java": (
+                    os.access(Path(settings.java_home) / "bin/java", os.X_OK)
+                    if settings.java_home else bool(shutil.which("java"))
+                ),
+                "readelf": bool(find_readelf()),
+            }
+        details.update(ready=ok, tools=tools)
+        return JSONResponse(details, status_code=200 if ok else 503)
 
     @app.post(
         "/v1/analyze",
@@ -247,13 +221,26 @@ def create_app(settings: StaticAnalysisSettings | None = None) -> FastAPI:
                     capacity.release(profile)
 
         try:
+            if workers is not None:
+                params = {
+                    "profile": profile.value, "filename": name,
+                    "include_file_tree": str(include_file_tree).lower(),
+                }
+                if output is not None:
+                    params["output"] = output.value
+                response = WorkerJobResponse(
+                    workers, request, settings, profile, params, content_type, cleanup=cleanup
+                )
+                response_owns_job = True
+                return response
+
             temporary = tempfile.TemporaryDirectory(prefix="apk-lens-", dir=settings.work_dir)
             job_dir = Path(temporary.name).resolve()
             (job_dir / "tmp").mkdir()
             (job_dir / "artifacts").mkdir()
             metadata = await upload(request, job_dir / "sample.apk", name, settings)
-            report = await analyze_while_connected(
-                request, job_dir, profile, settings, include_file_tree=include_file_tree
+            report = await while_connected(
+                request, analyze_job(job_dir, profile, settings, include_file_tree=include_file_tree)
             )
             modules = report["modules"]
             metadata["md5"] = modules["basic"]["data"]["md5"]
@@ -283,8 +270,15 @@ def create_app(settings: StaticAnalysisSettings | None = None) -> FastAPI:
                 "INVALID_APK": 422,
                 "APK_IDENTITY_UNRESOLVED": 422,
                 "STAGE_TIMEOUT": 504,
+                "STAGE_CPU_LIMIT": 503,
+                "STAGE_MEMORY_LIMIT": 503,
+                "WORKSPACE_LIMIT": 507,
             }.get(exc.code, 502)
             raise error(status, exc.code, str(exc)) from exc
+        except OSError as exc:
+            if exc.errno not in {errno.ENOSPC, errno.EDQUOT}:
+                raise
+            raise error(507, "WORKSPACE_LIMIT", "解析临时空间不足") from exc
         finally:
             if not response_owns_job:
                 await cleanup()

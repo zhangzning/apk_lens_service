@@ -1,0 +1,75 @@
+x-security: &security
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  stop_grace_period: 15s
+  restart: unless-stopped
+  # Docker Engine's default seccomp profile applies to both image targets.
+
+x-worker: &worker
+  <<: *security
+  image: apk-lens-service:worker
+  pull_policy: never
+  network_mode: none
+  cpus: "${APK_LENS_WORKER_CPUS:-2.0}"
+  mem_limit: "${APK_LENS_WORKER_MEMORY:-4g}"
+  memswap_limit: "${APK_LENS_WORKER_MEMORY:-4g}"
+  pids_limit: ${APK_LENS_WORKER_PIDS:-192}
+  tmpfs:
+    - "/work:rw,nosuid,nodev,noexec,size=${APK_LENS_WORKER_TMPFS:-2g},uid=10001,gid=10001,mode=0700"
+  environment:
+    APK_LENS_SERVICE_LISTEN_SOCKET: /run/apk-lens/worker.sock
+    APK_LENS_SERVICE_WORK_DIR: /work
+    APK_LENS_SERVICE_MAX_JOBS: "1"
+    APK_LENS_SERVICE_JADX_MAX_HEAP_MB: "${APK_LENS_WORKER_JADX_HEAP_MIB:-1536}"
+    APK_LENS_SERVICE_WORKER_CPU_SECONDS: "${APK_LENS_WORKER_CPU_SECONDS:-900}"
+    APK_LENS_SERVICE_WORKER_MAX_FILE_MIB: "${APK_LENS_WORKER_MAX_FILE_MIB:-256}"
+    APK_LENS_SERVICE_WORKER_ADDRESS_SPACE_MIB: "${APK_LENS_WORKER_ADDRESS_SPACE_MIB:-8192}"
+
+services:
+  api:
+    <<: *security
+    build:
+      context: .
+      target: api
+    image: apk-lens-service:api
+    pull_policy: never
+    cpus: "1.0"
+    mem_limit: "384m"
+    memswap_limit: "384m"
+    pids_limit: 64
+    ports:
+      - "${APK_LENS_BIND_ADDRESS:-127.0.0.1}:${APK_LENS_PORT:-18086}:18086"
+    tmpfs:
+      - "/tmp:rw,nosuid,nodev,noexec,size=16m,uid=10001,gid=10001,mode=0700"
+    environment:
+      APK_LENS_SERVICE_HOST: 0.0.0.0
+      APK_LENS_SERVICE_TOKEN: "${APK_LENS_SERVICE_TOKEN:?Set APK_LENS_SERVICE_TOKEN}"
+      APK_LENS_SERVICE_WORKER_SOCKETS: '["/run/apk-lens/worker-1/worker.sock","/run/apk-lens/worker-2/worker.sock"]'
+    volumes:
+      - worker-1-socket:/run/apk-lens/worker-1:ro
+      - worker-2-socket:/run/apk-lens/worker-2:ro
+  worker-1:
+    <<: *worker
+    build:
+      context: .
+      target: worker
+    volumes:
+      - worker-1-socket:/run/apk-lens:rw
+  worker-2:
+    <<: *worker
+    volumes:
+      - worker-2-socket:/run/apk-lens:rw
+
+volumes:
+  worker-1-socket:
+    driver: local
+    driver_opts: &socket_tmpfs
+      type: tmpfs
+      device: tmpfs
+      o: size=1m,nosuid,nodev,noexec,uid=10001,gid=10001,mode=0700
+  worker-2-socket:
+    driver: local
+    driver_opts: *socket_tmpfs

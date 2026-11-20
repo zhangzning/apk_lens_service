@@ -28,6 +28,8 @@ def decompile_apk(
     apk_file: Path,
     output_dir: Path,
     timeout: int | None = None,
+    *,
+    temp_dir: Path | None = None,
 ) -> dict:
     """调用 jadx 反编译 APK 源码到指定目录。
 
@@ -57,6 +59,7 @@ def decompile_apk(
         env=java_tool_environment(
             settings.java_home,
             max_heap_mb=settings.jadx_max_heap_mb,
+            temp_dir=temp_dir,
         ),
     )
 

@@ -18,6 +18,8 @@ class StaticAnalysisSettings(BaseSettings):
 
     host: str = "127.0.0.1"
     port: int = Field(default=18086, ge=1, le=65535)
+    listen_socket: Path | None = None
+    worker_sockets: tuple[Path, ...] = ()
     token: SecretStr = SecretStr("")
     work_dir: Path = Field(default_factory=lambda: Path(tempfile.gettempdir()))
     max_jobs: int = Field(default=2, ge=1, le=8)
@@ -36,11 +38,24 @@ class StaticAnalysisSettings(BaseSettings):
     jadx_bin: str = "jadx"
     java_home: str = ""
     jadx_max_heap_mb: int = Field(default=1536, ge=512, le=8192)
+    worker_cpu_seconds: int = Field(default=0, ge=0)
+    worker_address_space_mib: int = Field(default=0, ge=0)
+    worker_max_file_mib: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def check_service_limits(self):
         if self.max_deep_jobs > self.max_jobs:
             raise ValueError("max_deep_jobs 不能超过 max_jobs")
+        if self.listen_socket is not None:
+            if not self.listen_socket.is_absolute() or self.worker_sockets or self.max_jobs != 1:
+                raise ValueError("解析实例需要一个绝对套接字路径，并且只接受一个并发任务")
+            return self
+        if self.worker_sockets and (
+            len(set(self.worker_sockets)) != len(self.worker_sockets)
+            or any(not path.is_absolute() for path in self.worker_sockets)
+            or self.max_jobs > len(self.worker_sockets)
+        ):
+            raise ValueError("worker_sockets 需要互不相同的绝对路径，且数量须覆盖 max_jobs")
         try:
             loopback = ipaddress.ip_address(self.host).is_loopback
         except ValueError:
@@ -59,6 +74,9 @@ class ParseToolSettings(BaseSettings):
     jadx_max_heap_mb: int = 1536
     jadx_timeout_seconds: int = 900
     icon_storage_dir: Path = Path("icon")
+    cpu_seconds: int = Field(default=0, ge=0)
+    address_space_mib: int = Field(default=0, ge=0)
+    max_file_mib: int = Field(default=0, ge=0)
 
 
 parse_tools = ParseToolSettings()

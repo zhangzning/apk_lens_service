@@ -1,7 +1,7 @@
 """单阶段进程入口。每次从一个临时目录读取 sample.apk 并写出阶段报告。"""
 
 import argparse
-import json
+import errno
 import logging
 import stat
 from collections.abc import Iterable
@@ -9,7 +9,8 @@ from pathlib import Path, PureWindowsPath
 from zipfile import BadZipFile, ZipFile
 
 from apk_lens_service.artifacts import AnalysisError, checked_files, encode_report
-from apk_lens_service.config import Profile
+from apk_lens_service.config import Profile, parse_tools
+from apk_lens_service.worker_limits import apply_process_limits
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +111,7 @@ def analyze_deep(apk: Path, artifacts: Path, *, byte_limit: int, file_limit: int
 
     decompiled = artifacts / "jadx"
     try:
-        jadx_summary = decompile_apk(apk, decompiled)
+        jadx_summary = decompile_apk(apk, decompiled, temp_dir=artifacts.parent / "tmp")
     except FileNotFoundError as exc:
         raise AnalysisError("JADX_UNAVAILABLE", "JADX 或 Java 不可用") from exc
     except RuntimeError as exc:
@@ -188,10 +189,11 @@ def main() -> int:
     parser.add_argument("--include-file-tree", action="store_true")
     args = parser.parse_args()
     apk = args.job_dir / "sample.apk"
-    from loguru import logger as androguard_logger
-
-    androguard_logger.remove()
     try:
+        apply_process_limits(parse_tools)
+        from loguru import logger as androguard_logger
+
+        androguard_logger.remove()
         if args.stage == "certificate":
             result = analyze_certificate(apk)
         elif args.stage == "deep":
@@ -208,6 +210,19 @@ def main() -> int:
         payload = encode_report({"modules": result})
     except AnalysisError as exc:
         payload = encode_report({"error": {"code": exc.code, "message": str(exc)}})
+    except OSError as exc:
+        errors = {
+            errno.EFBIG: ("RESULT_LIMIT", "解析阶段超过单文件大小上限"),
+            errno.ENOSPC: ("WORKSPACE_LIMIT", "解析临时空间不足"),
+            errno.EDQUOT: ("WORKSPACE_LIMIT", "解析临时空间达到配额"),
+        }
+        if exc.errno not in errors:
+            logger.exception("静态解析阶段异常: %s", args.stage)
+            return 1
+        code, message = errors[exc.errno]
+        payload = encode_report({"error": {"code": code, "message": message}})
+    except MemoryError:
+        payload = encode_report({"error": {"code": "STAGE_MEMORY_LIMIT", "message": "解析阶段内存分配失败"}})
     except Exception:
         logger.exception("静态解析阶段异常: %s", args.stage)
         return 1

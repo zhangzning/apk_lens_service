@@ -73,6 +73,7 @@ dependencies = [
     { name = "androguard" },
     { name = "anyio" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "javalang" },
     { name = "loguru" },
     { name = "mutf8" },
@@ -84,7 +85,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "pytest" },
 ]
 
@@ -93,6 +93,7 @@ requires-dist = [
     { name = "androguard", specifier = "==4.1.3" },
     { name = "anyio", specifier = "==4.14.2" },
     { name = "fastapi", specifier = "==0.115.12" },
+    { name = "httpx", specifier = "==0.28.1" },
     { name = "javalang", specifier = "==0.13.0" },
     { name = "loguru", specifier = "==0.7.3" },
     { name = "mutf8", specifier = "==1.1.0" },
@@ -103,10 +104,7 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-dev = [
-    { name = "httpx", specifier = "==0.28.1" },
-    { name = "pytest", specifier = "==9.1.1" },
-]
+dev = [{ name = "pytest", specifier = "==9.1.1" }]
 
 [[package]]
 name = "apkinspector"

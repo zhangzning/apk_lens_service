@@ -6,6 +6,7 @@
 import hashlib
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import unicodedata
@@ -56,6 +57,7 @@ def java_tool_environment(
     java_home: str | Path | None,
     *,
     max_heap_mb: int | None = None,
+    temp_dir: Path | None = None,
 ) -> dict[str, str]:
     """为 JADX 等 Java 工具构造可审计、与 systemd 环境无关的运行环境。
 
@@ -80,24 +82,18 @@ def java_tool_environment(
             if current_path
             else str(java_bin.parent)
         )
-        if max_heap_mb is not None:
-            existing_opts = environment.get("JADX_OPTS", "").strip()
-            environment["JADX_OPTS"] = (
-                f"{existing_opts} -Xmx{int(max_heap_mb)}m "
-                "-XX:+ExitOnOutOfMemoryError"
-            ).strip()
-        return environment
-
-    if shutil.which("java", path=environment.get("PATH")) is None:
+    elif shutil.which("java", path=environment.get("PATH")) is None:
         raise FileNotFoundError(
             "未配置 JAVA_HOME，且服务 PATH 中找不到 java；请在系统配置中填写 Java/JDK 目录"
         )
+    options = []
     if max_heap_mb is not None:
+        options.extend((f"-Xmx{int(max_heap_mb)}m", "-XX:+ExitOnOutOfMemoryError"))
+    if temp_dir is not None:
+        options.extend((f"-Djava.io.tmpdir={temp_dir}", f"-Duser.home={temp_dir}"))
+    if options:
         existing_opts = environment.get("JADX_OPTS", "").strip()
-        environment["JADX_OPTS"] = (
-            f"{existing_opts} -Xmx{int(max_heap_mb)}m "
-            "-XX:+ExitOnOutOfMemoryError"
-        ).strip()
+        environment["JADX_OPTS"] = f"{existing_opts} {shlex.join(options)}".strip()
     return environment
 
 

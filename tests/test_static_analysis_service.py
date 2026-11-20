@@ -1,7 +1,10 @@
 import asyncio
 import io
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from zipfile import ZipFile
@@ -76,6 +79,90 @@ def test_concurrent_apks_run_in_different_processes_with_capacity_limit(tmp_path
             assert list(scratch.iterdir()) == []
 
     asyncio.run(exercise())
+
+
+def test_unix_gateway_relays_and_cleans_worker_jobs(tmp_path):
+    scratch = tmp_path / "worker"
+    scratch.mkdir()
+    tool = write_fallback_tool(
+        tmp_path, "(Path(os.environ['TMPDIR']) / 'parsing').touch()\ntime.sleep(0.7)"
+    )
+    env = {name: value for name, value in os.environ.items() if not name.startswith("APK_LENS_SERVICE_")}
+    with tempfile.TemporaryDirectory(prefix="lens-uds-", dir="/tmp") as sockets:
+        path = Path(sockets) / "worker.sock"
+        env.update(
+            APK_LENS_SERVICE_LISTEN_SOCKET=str(path),
+            APK_LENS_SERVICE_WORK_DIR=str(scratch),
+            APK_LENS_SERVICE_MAX_JOBS="1",
+            APK_LENS_SERVICE_AAPT2_BIN=str(tool),
+        )
+        gateway_scratch = tmp_path / "gateway"
+        app = create_app(
+            StaticAnalysisSettings(
+                worker_sockets=(Path(sockets) / "missing.sock", path),
+                work_dir=gateway_scratch, max_apk_mib=1, token="test-gateway-token",
+            )
+        )
+        headers = {**APK_HEADERS, "Authorization": "Bearer test-gateway-token"}
+        payload = archive_with_unreadable_manifest()
+
+        async def exercise():
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://static.test"
+            ) as client:
+                async with asyncio.timeout(5):
+                    while (await client.get("/readyz")).status_code != 200:
+                        await asyncio.sleep(0.05)
+                assert (await client.get("/readyz")).json()["workers"] == {"ready": 1, "configured": 2}
+                endpoint = (
+                    "/v1/analyze?profile=basic&output=zip&include_file_tree=true&filename=fixture.apk"
+                )
+                assert (await client.post(endpoint, headers=APK_HEADERS, content=payload)).status_code == 401
+                result = await client.post(endpoint, headers=headers, content=payload)
+                assert result.status_code == 200, result.text
+                with ZipFile(io.BytesIO(result.content)) as bundle:
+                    report = json.loads(bundle.read("result.json"))
+                assert report["input"]["filename"] == "fixture.apk"
+                assert report["modules"]["basic"]["data"]["file_tree"] == [
+                    "AndroidManifest.xml", "assets/fixture.txt",
+                ]
+                assert not gateway_scratch.exists()
+
+                async def large_upload():
+                    for _ in range(3):
+                        yield b"x" * (512 * 1024)
+
+                result = await client.post(endpoint, headers=headers, content=large_upload())
+                assert result.status_code == 413
+                assert result.json()["detail"]["code"] == "APK_SIZE_LIMIT"
+                async with asyncio.timeout(4):
+                    while list(scratch.iterdir()):
+                        await asyncio.sleep(0.02)
+
+                pending = asyncio.create_task(client.post(endpoint, headers=headers, content=payload))
+                async with asyncio.timeout(5):
+                    while not any(scratch.glob("*/tmp/parsing")):
+                        await asyncio.sleep(0.02)
+                    pending.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await pending
+                    while list(scratch.iterdir()):
+                        await asyncio.sleep(0.02)
+                assert (await client.get("/readyz")).json()["jobs"]["active"] == 0
+
+        with (tmp_path / "worker.log").open("w+") as log:
+            worker = subprocess.Popen(
+                [sys.executable, "-m", "apk_lens_service"], env=env, stdout=log, stderr=log
+            )
+            try:
+                asyncio.run(exercise())
+            except Exception:
+                log.seek(0)
+                print(log.read())
+                raise
+            finally:
+                worker.terminate()
+                worker.wait(timeout=12)
 
 
 @pytest.mark.parametrize("output", ["json", "zip"])

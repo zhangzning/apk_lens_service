@@ -1,0 +1,8 @@
+**
+!Dockerfile
+!README.md
+!pyproject.toml
+!uv.lock
+!apk_lens_service/
+!apk_lens_service/*.py
+!apk_lens_service/*.json

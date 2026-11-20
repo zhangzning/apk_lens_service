@@ -33,9 +33,14 @@ class StageResult:
 def child_environment(job_dir: Path, settings: StaticAnalysisSettings) -> dict[str, str]:
     allowed = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
     environment = {key: os.environ[key] for key in allowed if key in os.environ}
+    temporary = job_dir / "tmp"
     environment.update(
         {
-            "TMPDIR": str(job_dir / "tmp"),
+            "TMPDIR": str(temporary),
+            "HOME": str(temporary),
+            "JADX_TMP_DIR": str(temporary / "jadx-temp"),
+            "JADX_CACHE_DIR": str(temporary / "jadx-cache"),
+            "JADX_CONFIG_DIR": str(temporary / "jadx-config"),
             "APK_LENS_SERVICE_TOOL_ICON_STORAGE_DIR": str(job_dir / "artifacts" / "icon"),
             "APK_LENS_SERVICE_TOOL_AAPT2_BIN": settings.aapt2_bin,
             "APK_LENS_SERVICE_TOOL_JADX_BIN": settings.jadx_bin,
@@ -44,6 +49,9 @@ def child_environment(job_dir: Path, settings: StaticAnalysisSettings) -> dict[s
             "APK_LENS_SERVICE_TOOL_JADX_TIMEOUT_SECONDS": str(
                 max(300, min(3600, int(settings.deep_timeout)))
             ),
+            "APK_LENS_SERVICE_TOOL_CPU_SECONDS": str(settings.worker_cpu_seconds),
+            "APK_LENS_SERVICE_TOOL_ADDRESS_SPACE_MIB": str(settings.worker_address_space_mib),
+            "APK_LENS_SERVICE_TOOL_MAX_FILE_MIB": str(settings.worker_max_file_mib),
         }
     )
     return environment
@@ -103,6 +111,17 @@ async def run_stage(
     except asyncio.CancelledError:
         await stop_group(process, settings.terminate_grace)
         raise
+
+    # A stage may exit while tools are still in its process group.
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    if process.returncode in {-signal.SIGXCPU, -signal.SIGXFSZ}:
+        code, message = (
+            ("STAGE_CPU_LIMIT", "解析阶段超过 CPU 时间上限")
+            if process.returncode == -signal.SIGXCPU
+            else ("RESULT_LIMIT", "解析阶段超过单文件大小上限")
+        )
+        return StageResult("failed", {}, {"code": code, "message": message}, process.pid)
 
     report = job_dir / f"{stage}.json"
     if process.returncode == 0 and report.is_file() and report.stat().st_size <= MAX_REPORT_BYTES:
