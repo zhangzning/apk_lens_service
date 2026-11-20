@@ -48,9 +48,13 @@ services:
       APK_LENS_SERVICE_HOST: 0.0.0.0
       APK_LENS_SERVICE_TOKEN: "${APK_LENS_SERVICE_TOKEN:?Set APK_LENS_SERVICE_TOKEN}"
       APK_LENS_SERVICE_WORKER_SOCKETS: '["/run/apk-lens/worker-1/worker.sock","/run/apk-lens/worker-2/worker.sock"]'
+      APK_LENS_SERVICE_JOBS_DIR: /var/lib/apk-lens/jobs
+      APK_LENS_SERVICE_JOB_TTL_SECONDS: "${APK_LENS_JOB_TTL_SECONDS:-900}"
+      APK_LENS_SERVICE_JOBS_STORAGE_MIB: "${APK_LENS_JOBS_STORAGE_MIB:-2048}"
     volumes:
       - worker-1-socket:/run/apk-lens/worker-1:ro
       - worker-2-socket:/run/apk-lens/worker-2:ro
+      - api-jobs:/var/lib/apk-lens/jobs
   worker-1:
     <<: *worker
     build:
@@ -64,6 +68,7 @@ services:
       - worker-2-socket:/run/apk-lens:rw
 
 volumes:
+  api-jobs:
   worker-1-socket:
     driver: local
     driver_opts: &socket_tmpfs

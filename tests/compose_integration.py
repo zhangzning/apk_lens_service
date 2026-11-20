@@ -9,6 +9,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.client import HTTPException
 from pathlib import Path
 from urllib.error import HTTPError
@@ -209,22 +210,71 @@ def check_recovery(stack, apk):
     age = (datetime.datetime.now(datetime.timezone.utc) - started_at).total_seconds()
     # Docker activates its restart policy after a successful start (10 seconds).
     time.sleep(max(0, min(11, 11 - age)))
-    stack.exec_worker("worker-1", """
+    crash_inflight = """
         import os
         import signal
+        import time
         from pathlib import Path
 
-        for process in Path("/proc").glob("[0-9]*"):
-            try:
-                args = (process / "cmdline").read_bytes().split(bytes([0]))
-                if args[1:3] == [b"-m", b"apk_lens_service"]:
-                    os.kill(int(process.name), signal.SIGKILL)
-                    break
-            except FileNotFoundError:
-                continue
+        def processes():
+            for process in Path("/proc").glob("[0-9]*"):
+                try:
+                    yield int(process.name), (process / "cmdline").read_bytes().split(bytes([0]))
+                except (FileNotFoundError, ProcessLookupError):
+                    pass
+
+        server = next(pid for pid, args in processes() if args[1:3] == [b"-m", b"apk_lens_service"])
+        Path("/work/recovery-probe-ready").touch()
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            if any(b"apk_lens_service.worker" in args and b"full" in args for _, args in processes()):
+                os.kill(server, signal.SIGKILL)
+                break
+            time.sleep(0.01)
         else:
-            raise AssertionError("Worker server process not found")
-    """, check=False)
+            raise AssertionError("Worker never started the APK parsing stage")
+    """
+
+    def probe_ready():
+        return stack.exec_worker(
+            "worker-1", 'from pathlib import Path; print(Path("/work/recovery-probe-ready").is_file())',
+            check=False,
+        ).strip() == b"True"
+
+    with ThreadPoolExecutor(max_workers=1) as probes:
+        watcher = probes.submit(stack.exec_worker, "worker-1", crash_inflight, check=False)
+        wait_for(probe_ready, "Crash probe did not start", timeout=8)
+        status, _, body = stack.request(
+            "/v1/jobs?profile=basic", data=apk,
+            headers={"Content-Type": "application/vnd.android.package-archive"},
+        )
+        assert status == 202, body[:300]
+        job = json.loads(body)
+        watcher.result(timeout=16)
+
+    def job_done():
+        _, _, body = stack.request(job["status_url"])
+        state = json.loads(body)
+        assert state["state"] != "failed", state
+        return state["state"] == "succeeded"
+
+    wait_for(job_done, "Job did not finish on the surviving worker")
+    finished = json.loads(stack.request(job["status_url"])[2])
+    assert finished["attempts"] == 2, finished
+    status, _, body = stack.request(job["result_url"])
+    assert status == 200 and json.loads(body)["modules"]["basic"]["data"]["package_name"] == PACKAGE
+    status, _, body = stack.request(
+        "/v1/jobs?profile=basic&filename=alias.apk", data=apk,
+        headers={"Content-Type": "application/vnd.android.package-archive"},
+    )
+    duplicate = json.loads(body)
+    assert status == 202 and duplicate["reused"] and duplicate["job_id"] == job["job_id"]
+
+    logs = stack.run("docker", "logs", api_id)
+    logs.check_returncode()
+    events = [json.loads(line) for line in logs.stdout.decode().splitlines() if line.startswith("{")]
+    assert any(event.get("event") == "job_retry" and event.get("job_id") == job["job_id"]
+               and event.get("error_code") == "WORKER_CONNECTION_FAILED" for event in events)
 
     def restarted():
         try:
@@ -258,7 +308,7 @@ def main():
         check_telemetry(stack, verify_request(stack, apk))
         print("APK parsing, request correlation and metrics passed", flush=True)
         check_recovery(stack, apk)
-        print("Stopped and crashed workers recovered on the same Unix socket", flush=True)
+        print("In-flight job replay, result reuse and worker recovery passed", flush=True)
     except Exception:
         print(stack.call("ps", "-a", check=False).decode(errors="replace"), file=sys.stderr)
         logs = stack.call("logs", "--no-color", "--tail", "40", check=False).decode(errors="replace")

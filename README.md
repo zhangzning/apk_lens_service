@@ -41,6 +41,8 @@ curl --fail http://127.0.0.1:18086/readyz
 | `APK_LENS_WORKER_CPU_SECONDS` | 单进程 CPU 时间上限，默认 900 秒 |
 | `APK_LENS_WORKER_MAX_FILE_MIB` | 单进程写入文件的大小上限，默认 256 MiB |
 | `APK_LENS_WORKER_ADDRESS_SPACE_MIB` | 单进程虚拟地址空间上限，默认 8192 MiB，0 为关闭。调整时用部署的 JDK 和代表性 APK 实测 |
+| `APK_LENS_JOB_TTL_SECONDS` | 异步状态和结果的保留时间，默认在任务结束后保留 900 秒 |
+| `APK_LENS_JOBS_STORAGE_MIB` | API 异步暂存空间的应用配额，默认 2048 MiB |
 
 `GET /readyz` 的 `workers` 字段报告可用解析容器数。一台离线时，API 仍将请求发往可用的容器。
 
@@ -72,6 +74,26 @@ curl --fail-with-body \
 
 深度模式的 ZIP 包含 `result.json`、可用图标、`jadx/` 和 `reverse/`。若选择 JSON，则仅返回报告和分析摘要。健康检查使用 `GET /healthz`，完整接口定义见 `GET /docs`。
 
+## 异步分析
+
+长时间分析使用 `POST /v1/jobs`。它接收与同步接口相同的 APK 正文和分析选项，上传完就返回 `202`、任务 ID 和两个查询地址。提交完成后可关闭连接。
+
+```sh
+curl --fail-with-body \
+  -H "Authorization: Bearer $APK_LENS_SERVICE_TOKEN" \
+  -H 'Content-Type: application/vnd.android.package-archive' \
+  --data-binary @sample.apk \
+  'http://127.0.0.1:18086/v1/jobs?profile=deep'
+```
+
+通过响应的 `status_url` 查询 `queued`、`running`、`succeeded` 或 `failed`。成功后访问 `result_url` 下载 JSON 或 ZIP。失败状态保存错误代码。查询和下载沿用服务的 Bearer 认证，未产出结果时下载接口返回 `409`。
+
+相同 SHA256、模式、输出格式和文件树选项会复用排队中、运行中或仍在保留期内的成功任务。提交响应的 `reused` 标识复用。异步报告使用 `sample.apk` 作为输入文件名，允许相同内容以不同上传名复用。任务状态为 `succeeded` 表示产物已生成，报告内仍会标记模块是否为 `partial`。
+
+解析期间 worker 连接中断或暂时没有可用 worker 时，任务最多重试一次。重试使用暂存的 APK 与原分析选项，优先选另一台可用 worker。任务结束即清理源 APK。状态与产物按 TTL 清理，API 重启后旧任务返回 `404`，可重新提交。Compose 使用只供 API 访问的暂存卷，服务启动时清理旧任务文件。
+
+异步解析与同步解析共用并发槽位。默认最多有 6 个未结束的异步任务（含正在上传和解析），最多保留 128 条任务记录。暂存空间需容纳各任务的 APK 和预留结果空间，达到上限时提交接口返回 `503`。
+
 ## 日志与指标
 
 API 在每次 HTTP 响应的 `X-Request-ID` 中返回服务生成的请求 ID，解析 worker 沿用它。排查某次请求时，可在 API 与 worker 的 JSON 日志中搜索该 ID。`request_finished` 记录请求耗时、HTTP 状态、结果和错误代码，`stage_finished` 记录解析阶段的耗时、状态和错误代码。报告的 `attempts[].duration_ms` 也会返回阶段耗时。
@@ -88,6 +110,16 @@ API 在每次 HTTP 响应的 `X-Request-ID` 中返回服务生成的请求 ID，
 | `apk_lens_worker_up` | Compose 中各 worker 的指标端点是否可用 |
 
 统计客户端请求时使用 `source="api"`，本机模式使用 `source="standalone"`。解析阶段在 Compose 中使用 `source="worker-1"`、`source="worker-2"`。计数器随对应进程重启而重置。请求 ID、文件名和令牌不作为指标标签。
+
+需要在 Prometheus 或 Grafana 查看跨 worker 的阶段 P95 耗时时，可按模式和阶段汇总直方图。
+
+```promql
+histogram_quantile(0.95,
+  sum by (profile, stage, le) (
+    rate(apk_lens_stage_duration_seconds_bucket{source=~"worker-[0-9]+"}[5m])
+  )
+)
+```
 
 ## 配置
 
@@ -111,6 +143,11 @@ API 在每次 HTTP 响应的 `X-Request-ID` 中返回服务生成的请求 ID，
 | `APK_LENS_SERVICE_WORKER_CPU_SECONDS` | 本机模式下的单进程 CPU 时间上限 |
 | `APK_LENS_SERVICE_WORKER_MAX_FILE_MIB` | 本机模式下的单文件大小上限 |
 | `APK_LENS_SERVICE_WORKER_ADDRESS_SPACE_MIB` | 单进程虚拟地址空间上限，按系统支持启用，建议在 Linux 上调试 |
+| `APK_LENS_SERVICE_JOBS_DIR` | 私有异步暂存目录。本机默认在系统临时目录下按用户和端口建立 |
+| `APK_LENS_SERVICE_JOB_TTL_SECONDS` | 完成后保留状态与结果的秒数，默认 900 |
+| `APK_LENS_SERVICE_MAX_PENDING_JOBS` | 待完成任务上限，含上传中的任务，默认 6 |
+| `APK_LENS_SERVICE_MAX_RETAINED_JOBS` | 暂存任务记录上限，默认 128 |
+| `APK_LENS_SERVICE_JOBS_STORAGE_MIB` | 暂存空间应用配额，默认 2048 MiB |
 
 本机模式下三个 `APK_LENS_SERVICE_WORKER_*` 进程限制的默认值均为 0（关闭）。
 
@@ -121,4 +158,4 @@ uv run --locked pytest -q
 python3 tests/compose_integration.py
 ```
 
-第二条命令需要 Linux Docker Engine、cgroup v2 和 Compose V2。测试使用独立的 Compose 项目和随机回环端口，生成一个小型 APK，验证静态解析、日志关联、指标、容器隔离和资源限额，再分别测试 worker 停机与进程崩溃后的恢复。测试结束后清理该项目的容器、卷和测试镜像。
+第二条命令需要 Linux Docker Engine、cgroup v2 和 Compose V2。测试生成一个小型 APK，验证静态解析、日志关联、指标、容器隔离和资源限额，也验证停掉 worker 后的接单切换、在途任务崩溃重试、结果复用和 worker 自动恢复。测试结束后清理该项目的容器、卷和测试镜像。

@@ -10,8 +10,10 @@ import os
 import shutil
 import tempfile
 from collections.abc import Awaitable, Callable
-from enum import StrEnum
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 
 import anyio
 from fastapi import FastAPI, Query, Request
@@ -24,16 +26,19 @@ from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, R
 
 from apk_lens_service.utils import find_readelf
 from apk_lens_service.artifacts import AnalysisError, checked_files, encode_report, write_bundle
-from apk_lens_service.config import MAX_INLINE_ICON_BYTES, MIB, Profile, StaticAnalysisSettings
+from apk_lens_service.config import MAX_INLINE_ICON_BYTES, MIB, OutputFormat, Profile, StaticAnalysisSettings
 from apk_lens_service.http_requests import apk_chunks, error, while_connected
+from apk_lens_service.jobs import Job, JobOptions, JobStore
 from apk_lens_service.supervisor import analyze_job
 from apk_lens_service.telemetry import REQUEST_ID_HEADER, Telemetry, TelemetryMiddleware, known_error
-from apk_lens_service.worker_proxy import SocketWorkers, WorkerJobResponse
+from apk_lens_service.worker_proxy import SocketWorkers, WorkerJobResponse, fetch_job_result
 
-
-class OutputFormat(StrEnum):
-    JSON = "json"
-    ZIP = "zip"
+APK_REQUEST_BODY = {
+    "requestBody": {
+        "required": True,
+        "content": {"application/vnd.android.package-archive": {"schema": {"type": "string", "format": "binary"}}},
+    },
+}
 
 
 class Capacity:
@@ -43,6 +48,7 @@ class Capacity:
         self.settings = settings
         self.active = 0
         self.deep = 0
+        self.released = asyncio.Event()
 
     def acquire(self, profile: Profile) -> bool:
         if self.active >= self.settings.max_jobs:
@@ -58,6 +64,12 @@ class Capacity:
         self.active -= 1
         if profile == Profile.DEEP:
             self.deep -= 1
+        self.released.set()
+
+    async def wait(self, profile: Profile) -> None:
+        while not self.acquire(profile):
+            self.released.clear()
+            await self.released.wait()
 
 
 class JobFileResponse(FileResponse):
@@ -81,13 +93,39 @@ def authorize(request: Request, settings: StaticAnalysisSettings) -> None:
         raise error(401, "UNAUTHORIZED", "需要服务凭据", headers={"WWW-Authenticate": "Bearer"})
 
 
-async def upload(request: Request, path: Path, filename: str, settings: StaticAnalysisSettings) -> dict:
+def upload_parameters(
+    request: Request, settings: StaticAnalysisSettings, filename: str, profile: Profile,
+) -> tuple[str, str, int | None]:
+    request.state.analysis_profile = profile.value
+    authorize(request, settings)
+    name = Path(filename.replace("\\", "/")).name
+    if not name.lower().endswith(".apk"):
+        raise error(422, "INVALID_APK_FILENAME", "文件名须以 .apk 结尾")
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type not in {"application/vnd.android.package-archive", "application/octet-stream"}:
+        raise error(415, "UNSUPPORTED_CONTENT_TYPE", "请求正文须为 APK 文件字节")
+    declared = None
+    if length := request.headers.get("content-length"):
+        if not length.isascii() or not length.isdigit() or len(length) > 16:
+            raise error(400, "INVALID_CONTENT_LENGTH", "Content-Length 无效")
+        declared = int(length)
+        if declared > settings.max_apk_mib * MIB:
+            raise error(413, "APK_SIZE_LIMIT", "上传的 APK 超过大小上限")
+    if profile == Profile.DEEP and settings.max_deep_jobs == 0:
+        raise error(503, "DEEP_DISABLED", "当前实例关闭深度分析")
+    return name, content_type, declared
+
+
+async def upload(
+    request: Request, path: Path, filename: str, settings: StaticAnalysisSettings, *, byte_limit: int | None = None,
+) -> dict:
     sha256 = hashlib.sha256()
     received = 0
+    byte_limit = settings.max_apk_mib * MIB if byte_limit is None else byte_limit
     try:
         async with asyncio.timeout(settings.upload_timeout), await anyio.open_file(path, "wb") as target:
             async for chunk in apk_chunks(
-                request, byte_limit=settings.max_apk_mib * MIB, timeout=settings.upload_timeout
+                request, byte_limit=byte_limit, timeout=settings.upload_timeout
             ):
                 received += len(chunk)
                 await target.write(chunk)
@@ -141,14 +179,82 @@ def materialize(
     return report_path
 
 
+def output_format(profile: Profile, requested: OutputFormat | None) -> OutputFormat:
+    return requested or (OutputFormat.ZIP if profile == Profile.DEEP else OutputFormat.JSON)
+
+
+def prepare_workspace(path: Path) -> None:
+    (path / "tmp").mkdir()
+    (path / "artifacts").mkdir()
+
+
+def complete_report(report: dict, metadata: dict, profile: Profile) -> None:
+    modules = report["modules"]
+    report.update(
+        schema_version=1,
+        input={**metadata, "md5": modules["basic"]["data"]["md5"]},
+        profile=profile.value,
+        status="ok" if all(module["status"] == "ok" for module in modules.values()) else "partial",
+    )
+
+
+def deliver_file(path: Path, output: OutputFormat, cleanup: Callable[[], Awaitable[None]]) -> JobFileResponse:
+    return JobFileResponse(
+        path, media_type=f"application/{output.value}",
+        filename="apk-lens-analysis.zip" if output == OutputFormat.ZIP else None,
+        headers={"Cache-Control": "no-store"}, cleanup=cleanup,
+    )
+
+
 def create_app(settings: StaticAnalysisSettings | None = None) -> FastAPI:
     settings = settings or StaticAnalysisSettings()
     capacity = Capacity(settings)
     workers = SocketWorkers(settings.worker_sockets) if settings.worker_sockets else None
-    app = FastAPI(title="APK Lens Service", version="1.0")
     private_worker = settings.listen_socket is not None
     source = "worker" if private_worker else "api" if workers is not None else "standalone"
     telemetry = Telemetry(source)
+
+    async def execute_job(job: Job) -> Path:
+        profile = job.options.profile
+        await capacity.wait(profile)
+        try:
+            job.state = "running"
+            if job.started_at is None:
+                job.started_at = datetime.now(timezone.utc)
+            if workers is not None:
+                return await fetch_job_result(workers, job, settings)
+            with tempfile.TemporaryDirectory(prefix="apk-lens-", dir=settings.work_dir) as temporary:
+                workspace = Path(temporary).resolve()
+                prepare_workspace(workspace)
+                await anyio.to_thread.run_sync(shutil.copyfile, job.sample, workspace / "sample.apk")
+                report = await analyze_job(
+                    workspace, profile, settings, include_file_tree=job.options.include_file_tree,
+                    telemetry=telemetry, request_id=job.request_id,
+                )
+                complete_report(report, job.metadata, profile)
+                assembled = await anyio.to_thread.run_sync(materialize, workspace, report, job.options.output, settings)
+                result = job.directory / f"result.{job.options.output.value}"
+                partial = job.directory / "result.part"
+                try:
+                    await anyio.to_thread.run_sync(shutil.copyfile, assembled, partial)
+                    partial.replace(result)
+                finally:
+                    partial.unlink(missing_ok=True)
+                return result
+        finally:
+            capacity.release(profile)
+
+    jobs = None if private_worker else JobStore(settings, execute_job, telemetry)
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        if jobs is None:
+            yield
+        else:
+            async with jobs.lifespan():
+                yield
+
+    app = FastAPI(title="APK Lens Service", version="1.0", lifespan=lifespan)
     app.add_middleware(TelemetryMiddleware, telemetry=telemetry, private_worker=private_worker)
 
     @app.exception_handler(HTTPException)
@@ -203,19 +309,64 @@ def create_app(settings: StaticAnalysisSettings | None = None) -> FastAPI:
         content = telemetry.scrape(capacity.active, capacity.deep, snapshots)
         return Response(content, media_type=CONTENT_TYPE_PLAIN_0_0_4, headers={"Cache-Control": "no-store"})
 
+    if jobs is not None:
+        @app.post("/v1/jobs", status_code=202, openapi_extra=APK_REQUEST_BODY)
+        async def submit_job(
+            request: Request, response: Response, profile: Profile = Profile.STANDARD,
+            output: OutputFormat | None = None,
+            filename: str = Query("sample.apk", min_length=1, max_length=240),
+            include_file_tree: bool = False,
+        ):
+            started = perf_counter()
+            _, _, declared = upload_parameters(request, settings, filename, profile)
+            byte_limit = settings.max_apk_mib * MIB if declared is None else declared
+
+            async def write(path: Path) -> dict:
+                return await upload(request, path, "sample.apk", settings, byte_limit=byte_limit)
+
+            options = JobOptions(profile, output_format(profile, output), include_file_tree)
+            try:
+                job, reused = await jobs.submit(options, request.state.request_id, byte_limit, write)
+            except ClientDisconnect as exc:
+                raise error(499, "CLIENT_DISCONNECTED", "调用方已断开") from exc
+            status_url = request.scope.get("root_path", "").rstrip("/") + f"/v1/jobs/{job.id}"
+            response.headers["Location"] = status_url
+            response.headers["Cache-Control"] = "no-store"
+            telemetry.event(
+                "job_submitted", request.state.request_id, perf_counter() - started,
+                job_id=job.id, reused=reused, profile=profile.value,
+            )
+            return {
+                **job.view(settings.job_ttl_seconds), "reused": reused,
+                "status_url": status_url, "result_url": f"{status_url}/result",
+            }
+
+        @app.get("/v1/jobs/{job_id}")
+        async def job_status(request: Request, response: Response, job_id: str):
+            authorize(request, settings)
+            response.headers["Cache-Control"] = "no-store"
+            return jobs.get(job_id).view(settings.job_ttl_seconds)
+
+        @app.get("/v1/jobs/{job_id}/result", response_class=FileResponse)
+        async def job_result(request: Request, job_id: str):
+            authorize(request, settings)
+            job = jobs.get(job_id)
+            if job.state == "failed":
+                raise error(409, job.failure["code"], job.failure["message"])
+            if job.result is None:
+                raise error(409, "JOB_NOT_READY", "任务尚未完成", headers={"Retry-After": "2"})
+            job.readers += 1
+
+            async def release_reader():
+                job.readers -= 1
+                jobs.prune()
+
+            return deliver_file(job.result, job.options.output, release_reader)
+
     @app.post(
         "/v1/analyze",
         response_class=FileResponse,
-        openapi_extra={
-            "requestBody": {
-                "required": True,
-                "content": {
-                    "application/vnd.android.package-archive": {
-                        "schema": {"type": "string", "format": "binary"}
-                    }
-                },
-            }
-        },
+        openapi_extra=APK_REQUEST_BODY,
         responses={200: {"content": {"application/json": {}, "application/zip": {}}}},
     )
     async def analyze(
@@ -225,21 +376,7 @@ def create_app(settings: StaticAnalysisSettings | None = None) -> FastAPI:
         filename: str = Query("sample.apk", min_length=1, max_length=240),
         include_file_tree: bool = Query(False, description="在基础信息中返回 APK 内的完整条目路径"),
     ):
-        request.state.analysis_profile = profile.value
-        authorize(request, settings)
-        name = Path(filename.replace("\\", "/")).name
-        if not name.lower().endswith(".apk"):
-            raise error(422, "INVALID_APK_FILENAME", "文件名须以 .apk 结尾")
-        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        if content_type not in {"application/vnd.android.package-archive", "application/octet-stream"}:
-            raise error(415, "UNSUPPORTED_CONTENT_TYPE", "请求正文须为 APK 文件字节")
-        if length := request.headers.get("content-length"):
-            if not length.isascii() or not length.isdigit() or len(length) > 16:
-                raise error(400, "INVALID_CONTENT_LENGTH", "Content-Length 无效")
-            if int(length) > settings.max_apk_mib * MIB:
-                raise error(413, "APK_SIZE_LIMIT", "上传的 APK 超过大小上限")
-        if profile == Profile.DEEP and settings.max_deep_jobs == 0:
-            raise error(503, "DEEP_DISABLED", "当前实例关闭深度分析")
+        name, content_type, _ = upload_parameters(request, settings, filename, profile)
         if not capacity.acquire(profile):
             raise error(503, "CAPACITY_EXHAUSTED", "解析服务繁忙", headers={"Retry-After": "5"})
 
@@ -270,8 +407,7 @@ def create_app(settings: StaticAnalysisSettings | None = None) -> FastAPI:
 
             temporary = tempfile.TemporaryDirectory(prefix="apk-lens-", dir=settings.work_dir)
             job_dir = Path(temporary.name).resolve()
-            (job_dir / "tmp").mkdir()
-            (job_dir / "artifacts").mkdir()
+            prepare_workspace(job_dir)
             metadata = await upload(request, job_dir / "sample.apk", name, settings)
             report = await while_connected(
                 request, analyze_job(
@@ -279,24 +415,11 @@ def create_app(settings: StaticAnalysisSettings | None = None) -> FastAPI:
                     telemetry=telemetry, request_id=request.state.request_id,
                 ),
             )
-            modules = report["modules"]
-            metadata["md5"] = modules["basic"]["data"]["md5"]
-            report.update(
-                schema_version=1,
-                input=metadata,
-                profile=profile.value,
-                status="ok" if all(module["status"] == "ok" for module in modules.values()) else "partial",
-            )
-            output = output or (OutputFormat.ZIP if profile == Profile.DEEP else OutputFormat.JSON)
+            complete_report(report, metadata, profile)
+            output = output_format(profile, output)
             result_path = await anyio.to_thread.run_sync(materialize, job_dir, report, output, settings)
             request.state.analysis_outcome = report["status"]
-            response = JobFileResponse(
-                result_path,
-                media_type="application/zip" if output == OutputFormat.ZIP else "application/json",
-                filename="apk-lens-analysis.zip" if output == OutputFormat.ZIP else None,
-                headers={"Cache-Control": "no-store"},
-                cleanup=cleanup,
-            )
+            response = deliver_file(result_path, output, cleanup)
             response_owns_job = True
             return response
         except ClientDisconnect as exc:

@@ -130,6 +130,113 @@ def test_concurrent_apks_run_in_different_processes_with_capacity_limit(tmp_path
     asyncio.run(exercise())
 
 
+def test_async_jobs_reuse_options_and_expire(tmp_path, monkeypatch):
+    import apk_lens_service.api as api_module
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    jobs_dir = tmp_path / "jobs"
+    tool = write_fallback_tool(tmp_path, "pass")
+    settings = StaticAnalysisSettings(
+        work_dir=scratch, jobs_dir=jobs_dir, aapt2_bin=str(tool), token="job-token",
+        max_jobs=1, job_ttl_seconds=1.0, max_apk_mib=2, max_result_mib=2, jobs_storage_mib=8,
+    )
+    original = api_module.analyze_job
+    headers = {**APK_HEADERS, "Authorization": "Bearer job-token"}
+    payload = archive_with_unreadable_manifest()
+
+    async def exercise():
+        entered = asyncio.Event()
+        unblock = asyncio.Event()
+
+        async def analyze(*args, **kwargs):
+            entered.set()
+            await unblock.wait()
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(api_module, "analyze_job", analyze)
+        app = create_app(settings)
+        async with app.router.lifespan_context(app), httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://static.test", headers=headers,
+        ) as client:
+            async def submit(suffix):
+                response = await client.post("/v1/jobs?profile=basic" + suffix, content=payload)
+                assert response.status_code == 202, response.text
+                return response.json()
+
+            async def completed(job):
+                async with asyncio.timeout(8):
+                    while True:
+                        status = (await client.get(job["status_url"])).json()
+                        if status["state"] not in {"running", "queued"}:
+                            assert status["state"] == "succeeded", status
+                            return await client.get(job["result_url"])
+                        await asyncio.sleep(0.02)
+
+            first = await submit("&filename=first.apk")
+            await asyncio.wait_for(entered.wait(), 2)
+            assert (await client.get(first["result_url"])).status_code == 409
+            duplicate = await submit("&filename=second.apk&output=json")
+            assert duplicate["job_id"] == first["job_id"] and duplicate["reused"]
+            second = await submit("&include_file_tree=true")
+            assert second["job_id"] != first["job_id"]
+            assert (await client.get(second["status_url"])).json()["state"] == "queued"
+            assert (await client.get("/readyz")).json()["jobs"]["active"] == 1
+            unblock.set()
+
+            report = (await completed(first)).json()
+            assert report["input"]["filename"] == "sample.apk"
+            assert "file_tree" not in report["modules"]["basic"]["data"]
+            cached = await submit("")
+            assert cached["job_id"] == first["job_id"] and cached["state"] == "succeeded"
+            assert cached["attempts"] == 1
+            expanded = (await completed(second)).json()
+            assert expanded["modules"]["basic"]["data"]["file_tree"] == ["AndroidManifest.xml", "assets/fixture.txt"]
+            assert all(not (directory / "sample.apk").exists() for directory in jobs_dir.glob("job-*"))
+
+            first_directory = jobs_dir / f"job-{first['job_id']}"
+            async with asyncio.timeout(4):
+                while first_directory.exists():
+                    await asyncio.sleep(0.03)
+            assert (await client.get(first["status_url"])).status_code == 404
+            return second["status_url"]
+
+    second_url = asyncio.run(exercise())
+    assert not list(jobs_dir.glob("job-*"))
+    stale = jobs_dir / ("job-" + "a" * 32)
+    stale.mkdir()
+    (stale / "sample.apk").write_bytes(payload)
+
+    async def restart():
+        app = create_app(settings)
+        async with app.router.lifespan_context(app), httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://static.test", headers=headers,
+        ) as client:
+            assert (await client.get(second_url)).status_code == 404
+            assert not stale.exists()
+
+    asyncio.run(restart())
+
+
+def test_async_spool_quota_rejects_without_leaking_upload(tmp_path):
+    settings = StaticAnalysisSettings(
+        work_dir=tmp_path, jobs_dir=tmp_path / "jobs",
+        max_apk_mib=2, jobs_storage_mib=1, max_result_mib=1,
+    )
+    app = create_app(settings)
+
+    async def exercise():
+        async with app.router.lifespan_context(app), httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://static.test",
+        ) as client:
+            result = await client.post("/v1/jobs", headers=APK_HEADERS, content=archive_with_unreadable_manifest())
+            assert result.status_code == 503, result.text
+            assert result.json()["detail"]["code"] == "JOB_STORAGE_FULL"
+            assert not list(settings.jobs_dir.glob("job-*"))
+
+    asyncio.run(exercise())
+
+
 def test_unix_gateway_relays_and_cleans_worker_jobs(tmp_path, caplog):
     caplog.set_level(logging.INFO, logger=EVENT_LOGGER)
     scratch = tmp_path / "worker"

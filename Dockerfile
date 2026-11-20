@@ -24,6 +24,7 @@ ENV PATH="/app/.venv/bin:${PATH}" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 ENTRYPOINT ["python", "-m", "apk_lens_service"]
 
 FROM runtime AS api
+RUN install -d -m 0700 -o 10001 -g 10001 /var/lib/apk-lens/jobs
 COPY apk_lens_service/ /app/apk_lens_service/
 USER 10001:10001
 

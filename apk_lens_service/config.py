@@ -13,6 +13,11 @@ class Profile(StrEnum):
     DEEP = "deep"
 
 
+class OutputFormat(StrEnum):
+    JSON = "json"
+    ZIP = "zip"
+
+
 class StaticAnalysisSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="APK_LENS_SERVICE_")
 
@@ -41,6 +46,11 @@ class StaticAnalysisSettings(BaseSettings):
     worker_cpu_seconds: int = Field(default=0, ge=0)
     worker_address_space_mib: int = Field(default=0, ge=0)
     worker_max_file_mib: int = Field(default=0, ge=0)
+    jobs_dir: Path | None = None
+    job_ttl_seconds: float = Field(default=900, gt=0, le=86400)
+    max_pending_jobs: int = Field(default=6, ge=1, le=64)
+    max_retained_jobs: int = Field(default=128, ge=1, le=2048)
+    jobs_storage_mib: int = Field(default=2048, ge=1, le=65536)
 
     @model_validator(mode="after")
     def check_service_limits(self):
