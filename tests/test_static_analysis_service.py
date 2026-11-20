@@ -1,7 +1,9 @@
 import asyncio
 import io
 import json
+import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -11,9 +13,11 @@ from zipfile import ZipFile
 
 import httpx
 import pytest
+from prometheus_client.parser import text_string_to_metric_families
 
 from apk_lens_service.api import create_app
 from apk_lens_service.config import StaticAnalysisSettings
+from apk_lens_service.telemetry import EVENT_LOGGER
 
 
 APK_HEADERS = {"Content-Type": "application/vnd.android.package-archive"}
@@ -43,6 +47,51 @@ def archive_with_unreadable_manifest() -> bytes:
         archive.writestr("AndroidManifest.xml", b"invalid binary XML")
         archive.writestr("assets/fixture.txt", b"fixture")
     return buffer.getvalue()
+
+
+def metric_values(text, name, **labels):
+    return [
+        sample.value
+        for family in text_string_to_metric_families(text)
+        for sample in family.samples
+        if sample.name == name and all(sample.labels.get(key) == value for key, value in labels.items())
+    ]
+
+
+def test_request_ids_and_error_metrics_do_not_include_client_data(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger=EVENT_LOGGER)
+    app = create_app(StaticAnalysisSettings(work_dir=tmp_path))
+
+    async def exercise():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://static.test"
+        ) as client:
+            forged_id = "a" * 32
+            result = await client.post(
+                "/v1/analyze?filename=external-input.apk",
+                headers={**APK_HEADERS, "X-Request-ID": forged_id}, content=b"",
+            )
+            assert result.status_code == 422
+            request_id = result.headers["x-request-id"]
+            assert re.fullmatch("[0-9a-f]{32}", request_id) and request_id != forged_id
+            invalid = await client.post("/v1/analyze?profile=wrong", headers=APK_HEADERS)
+            assert invalid.status_code == 422 and invalid.headers["x-request-id"] != request_id
+            metrics = (await client.get("/metrics")).text
+            assert metric_values(
+                metrics, "apk_lens_requests_total",
+                profile="standard", source="standalone", outcome="error", error_code="INVALID_APK",
+            ) == [1]
+            assert metric_values(metrics, "apk_lens_requests_total", error_code="REQUEST_VALIDATION_FAILED") == [1]
+            assert request_id not in metrics and forged_id not in metrics
+            return request_id
+
+    request_id = asyncio.run(exercise())
+    events = [json.loads(record.getMessage()) for record in caplog.records if record.name == EVENT_LOGGER]
+    assert len(events) == 2
+    first = events[0]
+    assert first["event"] == "request_finished" and first["request_id"] == request_id
+    assert first["error_code"] == "INVALID_APK" and first["duration_ms"] >= 0
+    assert "external-input.apk" not in caplog.text
 
 
 def test_concurrent_apks_run_in_different_processes_with_capacity_limit(tmp_path):
@@ -81,7 +130,8 @@ def test_concurrent_apks_run_in_different_processes_with_capacity_limit(tmp_path
     asyncio.run(exercise())
 
 
-def test_unix_gateway_relays_and_cleans_worker_jobs(tmp_path):
+def test_unix_gateway_relays_and_cleans_worker_jobs(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger=EVENT_LOGGER)
     scratch = tmp_path / "worker"
     scratch.mkdir()
     tool = write_fallback_tool(
@@ -120,13 +170,29 @@ def test_unix_gateway_relays_and_cleans_worker_jobs(tmp_path):
                 assert (await client.post(endpoint, headers=APK_HEADERS, content=payload)).status_code == 401
                 result = await client.post(endpoint, headers=headers, content=payload)
                 assert result.status_code == 200, result.text
+                request_id = result.headers["x-request-id"]
                 with ZipFile(io.BytesIO(result.content)) as bundle:
                     report = json.loads(bundle.read("result.json"))
                 assert report["input"]["filename"] == "fixture.apk"
+                assert report["attempts"][0]["duration_ms"] > 0
                 assert report["modules"]["basic"]["data"]["file_tree"] == [
                     "AndroidManifest.xml", "assets/fixture.txt",
                 ]
                 assert not gateway_scratch.exists()
+
+                bad = await client.post(endpoint, headers=headers, content=b"invalid")
+                assert bad.status_code == 422 and bad.json()["detail"]["code"] == "INVALID_APK"
+                assert (await client.get("/metrics")).status_code == 401
+                scrape = (await client.get("/metrics", headers=headers)).text
+                assert metric_values(scrape, "apk_lens_worker_up", source="worker-1") == [0]
+                assert metric_values(scrape, "apk_lens_worker_up", source="worker-2") == [1]
+                assert metric_values(scrape, "apk_lens_requests_total", source="api", outcome="partial") == [1]
+                assert metric_values(scrape, "apk_lens_requests_total", source="api", error_code="INVALID_APK") == [1]
+                assert metric_values(scrape, "apk_lens_stage_duration_seconds_count", source="worker-2", stage="full") == [2]
+                assert metric_values(
+                    scrape, "apk_lens_stage_duration_seconds_bucket", source="worker-2", stage="full", le="+Inf"
+                ) == [2]
+                assert request_id not in scrape and "test-gateway-token" not in scrape
 
                 async def large_upload():
                     for _ in range(3):
@@ -149,13 +215,14 @@ def test_unix_gateway_relays_and_cleans_worker_jobs(tmp_path):
                     while list(scratch.iterdir()):
                         await asyncio.sleep(0.02)
                 assert (await client.get("/readyz")).json()["jobs"]["active"] == 0
+                return request_id
 
         with (tmp_path / "worker.log").open("w+") as log:
             worker = subprocess.Popen(
                 [sys.executable, "-m", "apk_lens_service"], env=env, stdout=log, stderr=log
             )
             try:
-                asyncio.run(exercise())
+                request_id = asyncio.run(exercise())
             except Exception:
                 log.seek(0)
                 print(log.read())
@@ -163,6 +230,20 @@ def test_unix_gateway_relays_and_cleans_worker_jobs(tmp_path):
             finally:
                 worker.terminate()
                 worker.wait(timeout=12)
+            log.seek(0)
+            worker_events = [json.loads(line) for line in log if line.startswith("{")]
+            assert any(
+                event["event"] == "stage_finished" and event["request_id"] == request_id
+                for event in worker_events
+            )
+            assert any(
+                event["event"] == "request_finished" and event["request_id"] == request_id
+                for event in worker_events
+            )
+            assert any(
+                record.name == EVENT_LOGGER and json.loads(record.getMessage())["request_id"] == request_id
+                for record in caplog.records
+            )
 
 
 @pytest.mark.parametrize("output", ["json", "zip"])

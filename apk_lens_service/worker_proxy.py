@@ -14,6 +14,9 @@ from starlette.responses import Response, StreamingResponse
 
 from apk_lens_service.config import MIB, Profile, StaticAnalysisSettings
 from apk_lens_service.http_requests import apk_chunks, error, while_connected
+from apk_lens_service.telemetry import (
+    REQUEST_ID_HEADER, WORKER_ERROR_HEADER, WORKER_OUTCOME_HEADER, known_error,
+)
 
 
 def worker_client(path: Path) -> httpx.AsyncClient:
@@ -26,18 +29,28 @@ def worker_client(path: Path) -> httpx.AsyncClient:
     )
 
 
-async def probe(client: httpx.AsyncClient) -> dict | None:
+async def read_worker(client: httpx.AsyncClient, path: str, limit: int) -> bytes | None:
     try:
-        async with asyncio.timeout(1), client.stream("GET", "/readyz") as response:
+        async with asyncio.timeout(1), client.stream("GET", path) as response:
             if response.status_code != 200:
                 return None
             data = bytearray()
             async for chunk in response.aiter_raw(chunk_size=4096):
-                if len(data) + len(chunk) > 4096:
+                if len(data) + len(chunk) > limit:
                     return None
                 data.extend(chunk)
+        return bytes(data)
+    except (TimeoutError, httpx.HTTPError):
+        return None
+
+
+async def probe(client: httpx.AsyncClient) -> dict | None:
+    data = await read_worker(client, "/readyz", 4096)
+    if data is None:
+        return None
+    try:
         report = json.loads(data)
-    except (ValueError, RecursionError, TimeoutError, httpx.HTTPError):
+    except (ValueError, RecursionError):
         return None
     if (
         isinstance(report, dict)
@@ -65,6 +78,14 @@ class SocketWorkers:
             for tool in ("aapt2", "jadx", "java", "readelf")
         }
         return len(reports), tools
+
+    async def scrape_metrics(self) -> dict[str, bytes | None]:
+        async def scrape(path: Path) -> bytes | None:
+            async with worker_client(path) as client:
+                return await read_worker(client, "/metrics", 256 * 1024)
+
+        results = await asyncio.gather(*(scrape(path) for path in self.paths))
+        return {f"worker-{i}": contents for i, contents in enumerate(results, start=1)}
 
     @asynccontextmanager
     async def acquire(self):
@@ -130,7 +151,11 @@ class WorkerJobResponse(Response):
             read_timeout += settings.deep_timeout
         request = client.build_request(
             "POST", "/v1/analyze", params=self.params,
-            headers={"Content-Type": self.content_type}, content=body(),
+            headers={
+                "Content-Type": self.content_type,
+                REQUEST_ID_HEADER: self.request.state.request_id,
+            },
+            content=body(),
             timeout=httpx.Timeout(read_timeout, connect=1, write=settings.upload_timeout),
         )
         try:
@@ -155,6 +180,11 @@ class WorkerJobResponse(Response):
         size = int(length)
         if size > self.settings.max_result_mib * MIB:
             raise error(413, "RESULT_LIMIT", "解析产物超过大小上限")
+
+        if upstream.status_code >= 400:
+            self.request.state.analysis_error = known_error(upstream.headers.get(WORKER_ERROR_HEADER))
+        elif upstream.headers.get(WORKER_OUTCOME_HEADER) == "partial":
+            self.request.state.analysis_outcome = "partial"
 
         async def bounded_body():
             sent = 0

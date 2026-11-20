@@ -10,7 +10,7 @@ x-security: &security
 
 x-worker: &worker
   <<: *security
-  image: apk-lens-service:worker
+  image: "${APK_LENS_WORKER_IMAGE:-apk-lens-service:worker}"
   pull_policy: never
   network_mode: none
   cpus: "${APK_LENS_WORKER_CPUS:-2.0}"
@@ -34,7 +34,7 @@ services:
     build:
       context: .
       target: api
-    image: apk-lens-service:api
+    image: "${APK_LENS_API_IMAGE:-apk-lens-service:api}"
     pull_policy: never
     cpus: "1.0"
     mem_limit: "384m"

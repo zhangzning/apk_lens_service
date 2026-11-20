@@ -15,14 +15,19 @@ from pathlib import Path
 
 import anyio
 from fastapi import FastAPI, Query, Request
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from prometheus_client.exposition import CONTENT_TYPE_PLAIN_0_0_4
+from starlette.exceptions import HTTPException
 from starlette.requests import ClientDisconnect
-from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
 from apk_lens_service.utils import find_readelf
 from apk_lens_service.artifacts import AnalysisError, checked_files, encode_report, write_bundle
 from apk_lens_service.config import MAX_INLINE_ICON_BYTES, MIB, Profile, StaticAnalysisSettings
 from apk_lens_service.http_requests import apk_chunks, error, while_connected
 from apk_lens_service.supervisor import analyze_job
+from apk_lens_service.telemetry import REQUEST_ID_HEADER, Telemetry, TelemetryMiddleware, known_error
 from apk_lens_service.worker_proxy import SocketWorkers, WorkerJobResponse
 
 
@@ -141,6 +146,27 @@ def create_app(settings: StaticAnalysisSettings | None = None) -> FastAPI:
     capacity = Capacity(settings)
     workers = SocketWorkers(settings.worker_sockets) if settings.worker_sockets else None
     app = FastAPI(title="APK Lens Service", version="1.0")
+    private_worker = settings.listen_socket is not None
+    source = "worker" if private_worker else "api" if workers is not None else "standalone"
+    telemetry = Telemetry(source)
+    app.add_middleware(TelemetryMiddleware, telemetry=telemetry, private_worker=private_worker)
+
+    @app.exception_handler(HTTPException)
+    async def capture_http_error(request: Request, exc: HTTPException):
+        if isinstance(exc.detail, dict):
+            request.state.analysis_error = known_error(exc.detail.get("code"))
+        return await http_exception_handler(request, exc)
+
+    @app.exception_handler(RequestValidationError)
+    async def capture_validation_error(request: Request, exc: RequestValidationError):
+        request.state.analysis_error = "REQUEST_VALIDATION_FAILED"
+        return await request_validation_exception_handler(request, exc)
+
+    @app.exception_handler(Exception)
+    async def server_error(request: Request, exc: Exception):
+        # Starlette sends this response outside the application middleware.
+        headers = {REQUEST_ID_HEADER: request.state.request_id}
+        return PlainTextResponse("Internal Server Error", status_code=500, headers=headers)
 
     @app.get("/healthz")
     async def health():
@@ -170,6 +196,13 @@ def create_app(settings: StaticAnalysisSettings | None = None) -> FastAPI:
         details.update(ready=ok, tools=tools)
         return JSONResponse(details, status_code=200 if ok else 503)
 
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics(request: Request):
+        authorize(request, settings)
+        snapshots = await workers.scrape_metrics() if workers is not None else {}
+        content = telemetry.scrape(capacity.active, capacity.deep, snapshots)
+        return Response(content, media_type=CONTENT_TYPE_PLAIN_0_0_4, headers={"Cache-Control": "no-store"})
+
     @app.post(
         "/v1/analyze",
         response_class=FileResponse,
@@ -192,6 +225,7 @@ def create_app(settings: StaticAnalysisSettings | None = None) -> FastAPI:
         filename: str = Query("sample.apk", min_length=1, max_length=240),
         include_file_tree: bool = Query(False, description="在基础信息中返回 APK 内的完整条目路径"),
     ):
+        request.state.analysis_profile = profile.value
         authorize(request, settings)
         name = Path(filename.replace("\\", "/")).name
         if not name.lower().endswith(".apk"):
@@ -240,7 +274,10 @@ def create_app(settings: StaticAnalysisSettings | None = None) -> FastAPI:
             (job_dir / "artifacts").mkdir()
             metadata = await upload(request, job_dir / "sample.apk", name, settings)
             report = await while_connected(
-                request, analyze_job(job_dir, profile, settings, include_file_tree=include_file_tree)
+                request, analyze_job(
+                    job_dir, profile, settings, include_file_tree=include_file_tree,
+                    telemetry=telemetry, request_id=request.state.request_id,
+                ),
             )
             modules = report["modules"]
             metadata["md5"] = modules["basic"]["data"]["md5"]
@@ -252,6 +289,7 @@ def create_app(settings: StaticAnalysisSettings | None = None) -> FastAPI:
             )
             output = output or (OutputFormat.ZIP if profile == Profile.DEEP else OutputFormat.JSON)
             result_path = await anyio.to_thread.run_sync(materialize, job_dir, report, output, settings)
+            request.state.analysis_outcome = report["status"]
             response = JobFileResponse(
                 result_path,
                 media_type="application/zip" if output == OutputFormat.ZIP else "application/json",

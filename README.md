@@ -72,6 +72,23 @@ curl --fail-with-body \
 
 深度模式的 ZIP 包含 `result.json`、可用图标、`jadx/` 和 `reverse/`。若选择 JSON，则仅返回报告和分析摘要。健康检查使用 `GET /healthz`，完整接口定义见 `GET /docs`。
 
+## 日志与指标
+
+API 在每次 HTTP 响应的 `X-Request-ID` 中返回服务生成的请求 ID，解析 worker 沿用它。排查某次请求时，可在 API 与 worker 的 JSON 日志中搜索该 ID。`request_finished` 记录请求耗时、HTTP 状态、结果和错误代码，`stage_finished` 记录解析阶段的耗时、状态和错误代码。报告的 `attempts[].duration_ms` 也会返回阶段耗时。
+
+`GET /metrics` 提供 Prometheus 文本指标。配置令牌时，采集请求同样携带 Bearer 令牌。Compose 部署只需采集 API 的端点，它会通过 Unix 套接字获取各 worker 的指标。
+
+| 指标 | 内容 |
+| --- | --- |
+| `apk_lens_requests_total` | 按模式、HTTP 状态、结果与错误代码统计请求 |
+| `apk_lens_request_duration_seconds` | 请求耗时分布，包含上传和响应传输 |
+| `apk_lens_stages_total` | 按模式、阶段、状态与错误代码统计阶段执行 |
+| `apk_lens_stage_duration_seconds` | 解析阶段耗时分布 |
+| `apk_lens_active_jobs` | 当前全部任务与深度任务数 |
+| `apk_lens_worker_up` | Compose 中各 worker 的指标端点是否可用 |
+
+统计客户端请求时使用 `source="api"`，本机模式使用 `source="standalone"`。解析阶段在 Compose 中使用 `source="worker-1"`、`source="worker-2"`。计数器随对应进程重启而重置。请求 ID、文件名和令牌不作为指标标签。
+
 ## 配置
 
 下表列出常用环境变量。临时目录需预先创建并允许服务账户读写。监听非回环地址时需设置访问令牌。
@@ -97,4 +114,11 @@ curl --fail-with-body \
 
 本机模式下三个 `APK_LENS_SERVICE_WORKER_*` 进程限制的默认值均为 0（关闭）。
 
-运行测试使用 `uv run pytest -q`。
+## 测试
+
+```sh
+uv run --locked pytest -q
+python3 tests/compose_integration.py
+```
+
+第二条命令需要 Linux Docker Engine、cgroup v2 和 Compose V2。测试使用独立的 Compose 项目和随机回环端口，生成一个小型 APK，验证静态解析、日志关联、指标、容器隔离和资源限额，再分别测试 worker 停机与进程崩溃后的恢复。测试结束后清理该项目的容器、卷和测试镜像。

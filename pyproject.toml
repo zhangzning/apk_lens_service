@@ -17,6 +17,7 @@ dependencies = [
     "loguru==0.7.3",
     "mutf8==1.1.0",
     "Pillow==12.3.0",
+    "prometheus-client==0.26.0",
     "pydantic==2.11.4",
     "pydantic-settings==2.9.1",
     "uvicorn==0.34.2",

@@ -9,9 +9,11 @@ import sys
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 
 from apk_lens_service.artifacts import AnalysisError
 from apk_lens_service.config import MAX_REPORT_BYTES, MIB, Profile, StaticAnalysisSettings
+from apk_lens_service.telemetry import Telemetry, known_error
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -144,37 +146,60 @@ async def analyze_job(
     settings: StaticAnalysisSettings,
     *,
     include_file_tree: bool,
+    telemetry: Telemetry,
+    request_id: str,
 ) -> dict:
     attempts = []
-    base = await run_stage(
-        job_dir, "full", profile, settings.full_timeout, settings, include_file_tree=include_file_tree
-    )
-    attempts.append(base.attempt("full"))
+
+    async def execute(stage: str, timeout: float) -> StageResult:
+        start = perf_counter()
+        try:
+            result = await run_stage(
+                job_dir, stage, profile, timeout, settings,
+                include_file_tree=include_file_tree and stage in {"full", "aapt2"},
+            )
+        except asyncio.CancelledError:
+            telemetry.finish_stage(request_id, profile, stage, "cancelled", perf_counter() - start, "STAGE_CANCELLED")
+            raise
+        except Exception:
+            telemetry.finish_stage(request_id, profile, stage, "failed", perf_counter() - start, "STAGE_PROCESS_FAILED")
+            raise
+        duration = perf_counter() - start
+        state = result.state
+        reason = (known_error(result.error["code"]) or "OTHER_ERROR") if result.error else None
+        if state == "ok":
+            incomplete = [module for module in result.modules.values() if module["status"] != "ok"]
+            if incomplete:
+                state = "partial"
+                reason = next(
+                    (code for module in incomplete if (code := known_error(module.get("error", {}).get("code")))),
+                    "STAGE_PARTIAL",
+                )
+                decompiled = result.modules.get("decompile", {}).get("data", {})
+                if reason == "STAGE_PARTIAL" and decompiled.get("jadx_summary", {}).get("code") == 3:
+                    reason = "JADX_PARTIAL"
+        attempts.append({**result.attempt(stage), "duration_ms": round(duration * 1000, 2)})
+        telemetry.finish_stage(request_id, profile, stage, state, duration, reason)
+        return result
+
+    base = await execute("full", settings.full_timeout)
     if base.error and base.error["code"] in {"STAGE_TIMEOUT", "STAGE_PROCESS_FAILED"}:
         icon_dir = job_dir / "artifacts" / "icon"
         if icon_dir.is_dir():
             shutil.rmtree(icon_dir)
-        base = await run_stage(
-            job_dir, "aapt2", profile, settings.fallback_timeout, settings,
-            include_file_tree=include_file_tree,
-        )
-        attempts.append(base.attempt("aapt2"))
+        base = await execute("aapt2", settings.fallback_timeout)
     if base.error:
         raise AnalysisError(base.error["code"], base.error["message"])
 
     modules = base.modules
     if profile != Profile.BASIC:
-        certificate = await run_stage(
-            job_dir, "certificate", profile, settings.certificate_timeout, settings
-        )
-        attempts.append(certificate.attempt("certificate"))
+        certificate = await execute("certificate", settings.certificate_timeout)
         if certificate.error:
             modules["certificate"] = {"status": certificate.state, "error": certificate.error}
         else:
             modules.update(certificate.modules)
     if profile == Profile.DEEP:
-        deep = await run_stage(job_dir, "deep", profile, settings.deep_timeout, settings)
-        attempts.append(deep.attempt("deep"))
+        deep = await execute("deep", settings.deep_timeout)
         if deep.error:
             modules["decompile"] = {"status": deep.state, "error": deep.error}
             modules["reverse"] = {"status": "unavailable"}
