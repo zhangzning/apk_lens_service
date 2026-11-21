@@ -6,6 +6,8 @@ x-security: &security
     - no-new-privileges:true
   stop_grace_period: 15s
   restart: unless-stopped
+  logging:
+    driver: local
   # Docker Engine's default seccomp profile applies to both image targets.
 
 x-worker: &worker
@@ -19,6 +21,20 @@ x-worker: &worker
   pids_limit: ${APK_LENS_WORKER_PIDS:-192}
   tmpfs:
     - "/work:rw,nosuid,nodev,noexec,size=${APK_LENS_WORKER_TMPFS:-2g},uid=10001,gid=10001,mode=0700"
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - |
+        import os, httpx
+        transport = httpx.HTTPTransport(uds=os.environ["APK_LENS_SERVICE_LISTEN_SOCKET"])
+        with httpx.Client(transport=transport, timeout=2, trust_env=False) as client:
+            client.get("http://localhost/readyz").raise_for_status()
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 20s
   environment:
     APK_LENS_SERVICE_LISTEN_SOCKET: /run/apk-lens/worker.sock
     APK_LENS_SERVICE_WORK_DIR: /work
@@ -44,6 +60,16 @@ services:
       - "${APK_LENS_BIND_ADDRESS:-127.0.0.1}:${APK_LENS_PORT:-18086}:18086"
     tmpfs:
       - "/tmp:rw,nosuid,nodev,noexec,size=16m,uid=10001,gid=10001,mode=0700"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import httpx; httpx.get("http://127.0.0.1:18086/readyz", timeout=3, trust_env=False).raise_for_status()
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     environment:
       APK_LENS_SERVICE_HOST: 0.0.0.0
       APK_LENS_SERVICE_TOKEN: "${APK_LENS_SERVICE_TOKEN:?Set APK_LENS_SERVICE_TOKEN}"

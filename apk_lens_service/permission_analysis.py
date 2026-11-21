@@ -13,16 +13,18 @@ import re
 import shutil
 import threading
 from collections import Counter, OrderedDict
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from androguard.core import api_specific_resources
 
 from apk_lens_service.config import parse_tools as settings
-from apk_lens_service.utils import run_command
+from apk_lens_service.manifest import declarations, read_xmltree
 
 
 PERMISSION_CATALOG_PATH = Path(__file__).with_name("android_permissions.json")
+SUPPLEMENTAL_DEFINITIONS_PATH = Path(__file__).with_name("aosp_permission_definitions.json")
 
 PROTECTION_BASE_MASK = 0xF
 PROTECTION_BASES = {
@@ -236,11 +238,9 @@ _DECLARED_PERMISSION_CACHE: OrderedDict[
 _CACHE_LOCK = threading.RLock()
 _DECLARED_PERMISSION_CACHE_SIZE = 128
 
-_ELEMENT_RE = re.compile(r"^(\s*)E:\s+([\w.-]+)(?:\s|$)")
-_NAME_RE = re.compile(r":name\([^)]*\)=\"([^\"]+)\"")
-_PROTECTION_RE = re.compile(
-    r":protectionLevel\([^)]*\)=(0x[0-9a-fA-F]+|\d+|\"[^\"]+\")"
-)
+# AOSP Dialer lists this name under the ZUK launcher, without defining a protection level.
+# https://android.googlesource.com/platform/packages/apps/Dialer/+/refs/tags/android-security-16.0.0_r6/AndroidManifest.xml
+VENDOR_PERMISSIONS = {"android.permission.READ_APP_BADGE": "ZUK"}
 
 
 def _load_description_catalog() -> dict[str, dict[str, Any]]:
@@ -325,6 +325,26 @@ def _load_platform_catalog(api_level: int | None) -> dict[str, dict[str, str]]:
     return loaded
 
 
+def _find_other_platform_definition(name: str, resolved_api: int) -> tuple[dict[str, str] | None, int | None]:
+    levels = _available_api_levels()
+    newer = [level for level in levels if level > resolved_api]
+    older = [level for level in reversed(levels) if level < resolved_api]
+    for level in newer + older:
+        if (info := _load_platform_catalog(level).get(name)) is not None:
+            return info, level
+    return None, None
+
+
+@lru_cache(maxsize=1)
+def _supplemental_definitions() -> dict[str, list[tuple[int, str, str]]]:
+    snapshots = json.loads(SUPPLEMENTAL_DEFINITIONS_PATH.read_text(encoding="utf-8"))
+    definitions: dict[str, list[tuple[int, str, str]]] = {}
+    for snapshot in sorted(snapshots, key=lambda snapshot: snapshot["api_level"]):
+        for name, protection in snapshot["permissions"].items():
+            definitions.setdefault(name, []).append((snapshot["api_level"], snapshot["reference"], protection))
+    return definitions
+
+
 def _normalise_protection_token(token: str) -> str:
     compact = re.sub(r"[-_\s]", "", token).lower()
     aliases = {
@@ -397,43 +417,6 @@ def decode_protection_level(raw_value: Any) -> tuple[str, list[str], str]:
     return base, flags, raw
 
 
-def _parse_declared_permissions_output(output: str) -> dict[str, dict[str, str]]:
-    """Extract top-level ``<permission>`` declarations from aapt2 xmltree."""
-
-    lines = output.splitlines()
-    declared: dict[str, dict[str, str]] = {}
-    index = 0
-    while index < len(lines):
-        element = _ELEMENT_RE.match(lines[index])
-        if not element or element.group(2) != "permission":
-            index += 1
-            continue
-
-        element_indent = len(element.group(1))
-        name = ""
-        raw_protection = ""
-        cursor = index + 1
-        while cursor < len(lines):
-            next_element = _ELEMENT_RE.match(lines[cursor])
-            if next_element and len(next_element.group(1)) <= element_indent:
-                break
-            if not name:
-                name_match = _NAME_RE.search(lines[cursor])
-                if name_match:
-                    name = name_match.group(1).strip()
-            protection_match = _PROTECTION_RE.search(lines[cursor])
-            if protection_match:
-                raw_protection = protection_match.group(1).strip('"')
-            cursor += 1
-
-        if name:
-            # Android defaults a declared permission with no protectionLevel to
-            # normal.  Keep that fact explicit for later analysis.
-            declared[name] = {"protectionLevel": raw_protection or "0x00000000"}
-        index = cursor
-    return declared
-
-
 def _read_declared_permissions_cached(
     apk_path: str,
     file_mtime_ns: int,
@@ -446,17 +429,14 @@ def _read_declared_permissions_cached(
         if cached is not None:
             _DECLARED_PERMISSION_CACHE.move_to_end(cache_key)
             return cached, "ready", ""
-    executable = shutil.which(aapt2_bin)
-    if not executable:
+    if not shutil.which(aapt2_bin):
         return {}, "unavailable", f"aapt2 不可用: {aapt2_bin}"
-    returncode, stdout, stderr = run_command(
-        [executable, "dump", "xmltree", "--file", "AndroidManifest.xml", apk_path],
-        timeout=20,
-    )
-    if returncode != 0 or not stdout:
-        detail = stderr[:200] if stderr else f"退出码 {returncode}"
+    root, detail = read_xmltree(Path(apk_path), aapt2_bin)
+    if root is None:
         return {}, "failed", f"APK 自定义权限解析失败: {detail}"
-    parsed = _parse_declared_permissions_output(stdout)
+    parsed, complete = declarations(root)
+    if not complete:
+        return parsed, "partial", "APK 自定义权限声明未全部读取"
     with _CACHE_LOCK:
         _DECLARED_PERMISSION_CACHE[cache_key] = parsed
         _DECLARED_PERMISSION_CACHE.move_to_end(cache_key)
@@ -492,11 +472,12 @@ def read_declared_permissions(apk_path: str | Path | None) -> dict[str, dict[str
 def _coerce_declared_permissions(
     declared_permissions: Mapping[str, Any] | None,
     apk_path: str | Path | None,
+    supplied_status: str,
 ) -> tuple[dict[str, dict[str, Any]], str, list[str]]:
     if declared_permissions is not None:
         source = declared_permissions
-        status = "provided"
-        warnings: list[str] = []
+        status = supplied_status
+        warnings = ["APK 自定义权限声明未全部读取"] if status == "partial" else []
     else:
         source, status, warning = _read_declared_permissions_with_status(apk_path)
         warnings = [warning] if warning else []
@@ -540,7 +521,7 @@ def _grantability_for_permission(
     permission_source: str,
     effective_target_sdk_version: int,
 ) -> tuple[str, str]:
-    if permission_source not in {"android", "app_declared"}:
+    if permission_source not in {"android", "app_declared"} or protection_level == "unknown":
         return "unknown", "需由权限定义方确认"
     special_access_min_api = SPECIAL_ACCESS_MIN_API.get(name)
     if (
@@ -592,35 +573,48 @@ def analyze_permissions(
     catalog: Mapping[str, Any] | None = None,
     declared_permissions: Mapping[str, Any] | None = None,
     min_sdk_version: Any = None,
+    *,
+    declared_permissions_status: str = "provided",
+    manifest_requests_status: str = "ok",
 ) -> dict[str, Any]:
     """Classify requested permissions without claiming they were granted."""
 
     requested_api, minimum_api, effective_api, resolved_api = _resolve_api_level(
         target_sdk_version, min_sdk_version
     )
-    platform_catalog = _load_platform_catalog(resolved_api)
-    platform_status = "ready" if platform_catalog else "unavailable"
-    description_catalog = dict(catalog) if catalog is not None else _load_description_catalog()
-    local_declarations, declaration_status, warnings = _coerce_declared_permissions(
-        declared_permissions, apk_path
-    )
-    if platform_status != "ready":
-        warnings.append("Android 平台权限元数据不可用，系统权限保护级别无法核验")
-    unique_names: list[str] = []
-    seen_names: set[str] = set()
-    for raw_name in permission_names:
-        if raw_name is None:
-            continue
-        name = str(raw_name).strip()
-        if name and name not in seen_names:
-            seen_names.add(name)
-            unique_names.append(name)
-    unique_names.sort()
+    unique_names = sorted({name for raw in permission_names if raw is not None and (name := str(raw).strip())})
+    platform_status = declaration_status = "not_applicable"
+    warnings: list[str] = []
+    if unique_names:
+        platform_catalog = _load_platform_catalog(resolved_api)
+        platform_status = "ready" if platform_catalog else "unavailable"
+        description_catalog = dict(catalog) if catalog is not None else _load_description_catalog()
+        local_declarations, declaration_status, warnings = _coerce_declared_permissions(
+            declared_permissions, apk_path, declared_permissions_status
+        )
+    if manifest_requests_status != "ok":
+        warnings.append("Manifest 权限申请记录未全部读取")
 
     items: list[dict[str, Any]] = []
+    unknown_descriptions = 0
     for name in unique_names:
         platform_info = platform_catalog.get(name)
+        definition_api = resolved_api if platform_info is not None else None
+        definition_reference = None
         custom_info = local_declarations.get(name)
+        vendor = VENDOR_PERMISSIONS.get(name)
+        if (
+            platform_info is None and custom_info is None and vendor is None
+            and resolved_api is not None and name.startswith("android.permission.")
+        ):
+            platform_info, definition_api = _find_other_platform_definition(name, resolved_api)
+        if platform_info is None and custom_info is None and vendor is None:
+            matches = _supplemental_definitions().get(name)
+            if matches:
+                definition_api, definition_reference, raw = next(
+                    (entry for entry in reversed(matches) if entry[0] <= effective_api), matches[0]
+                )
+                platform_info = {"protectionLevel": raw}
         if platform_info is not None:
             permission_source = "android"
             raw_protection = platform_info.get("protectionLevel", "")
@@ -629,6 +623,9 @@ def analyze_permissions(
             raw_protection = custom_info.get(
                 "protectionLevel", custom_info.get("protection_level", "0x00000000")
             )
+        elif vendor:
+            permission_source = "third_party"
+            raw_protection = ""
         elif name.startswith("android.permission."):
             permission_source = "android_unresolved"
             raw_protection = ""
@@ -639,7 +636,7 @@ def analyze_permissions(
             permission_source = "third_party"
             raw_protection = ""
 
-        if permission_source not in {"android", "app_declared"}:
+        if permission_source not in {"android", "app_declared"} or raw_protection is None:
             protection_level, protection_flags, protection_raw = "unknown", [], ""
         else:
             protection_level, protection_flags, protection_raw = decode_protection_level(raw_protection)
@@ -652,12 +649,15 @@ def analyze_permissions(
             permission_source,
             effective_api,
         )
-        catalog_info = description_catalog.get(name, {})
-        description = str(catalog_info.get("desc", "") or "").strip()
-        if not description and platform_info:
-            description = str(platform_info.get("description", "") or "").strip()
-        if not description and permission_source == "app_declared":
-            description = "应用自定义权限"
+        description = ""
+        if permission_source in {"android", "app_declared"} or vendor:
+            catalog_info = description_catalog.get(name, {})
+            description = str(catalog_info.get("desc", "") or "").strip()
+            if not description and platform_info:
+                description = str(platform_info.get("description", "") or "").strip()
+        if not description:
+            description = "未知"
+            unknown_descriptions += 1
 
         items.append(
             {
@@ -675,6 +675,9 @@ def analyze_permissions(
                 "protection_raw": protection_raw,
                 "protection_label": PROTECTION_LABELS.get(protection_level, "未识别"),
                 "permission_source": permission_source,
+                "definition_api_level": definition_api,
+                **({"definition_reference": definition_reference} if definition_reference else {}),
+                **({"permission_vendor": vendor} if permission_source == "third_party" and vendor else {}),
                 "risk_level": risk_level,
                 "risk_label": RISK_LABELS[risk_level],
                 "risk_reason": risk_reason,
@@ -710,11 +713,7 @@ def analyze_permissions(
         "unresolved", 0
     )
     if unresolved_count:
-        warnings.append(f"{unresolved_count} 项权限因元数据不完整而未能解析")
-    metadata_complete = platform_status == "ready" and declaration_status in {
-        "ready",
-        "provided",
-    } and not unresolved_count
+        warnings.append(f"{unresolved_count} 项已申请的权限缺少可核实的定义或归属")
     return {
         "schema_version": 2,
         "target_sdk_version": requested_api,
@@ -722,7 +721,8 @@ def analyze_permissions(
         "effective_target_sdk_version": effective_api,
         "resolved_api_level": resolved_api,
         "grant_state": "not_checked",
-        "analysis_status": "complete" if metadata_complete else "partial",
+        "manifest_requests_status": manifest_requests_status,
+        "analysis_status": "complete" if manifest_requests_status == "ok" else "partial",
         "metadata_status": {
             "platform_permissions": platform_status,
             "app_declarations": declaration_status,
@@ -739,6 +739,7 @@ def analyze_permissions(
             "protection_levels": dict(protection_counts),
             "risk_levels": dict(risk_counts),
             "permission_sources": dict(source_counts),
+            "unknown_description_count": unknown_descriptions,
         },
         "permissions": items,
     }

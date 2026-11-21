@@ -51,13 +51,15 @@ def analyze_base(
     # API 返回产物相对于 ZIP 的路径。请求临时目录仅供内部使用。
     base.pop("apk_path", None)
     base.pop("file_path", None)
+    supplied_declarations = base.pop("manifest_declared_permissions", None)
+    declarations_status = base.pop("manifest_declared_permissions_status", "provided")
     icon_path = base.get("icon_path")
     if icon_path:
         base["icon_path"] = f"icon/{Path(icon_path).name}"
 
-    components_ok = base["manifest_components_status"] == "ok"
+    manifest_ok = base["manifest_components_status"] == base["manifest_permission_requests_status"] == "ok"
     modules = {
-        "basic": {"status": "ok" if components_ok else "partial", "data": base},
+        "basic": {"status": "ok" if manifest_ok else "partial", "data": base},
         "packing": {"status": "ok", "data": quick_packing_check(apk)},
     }
     if profile != Profile.BASIC:
@@ -68,9 +70,12 @@ def analyze_base(
                 base["permissions"],
                 base["target_sdk_version"],
                 apk_path=apk,
+                declared_permissions=supplied_declarations,
                 min_sdk_version=base["min_sdk_version"],
+                declared_permissions_status=declarations_status,
+                manifest_requests_status=base["manifest_permission_requests_status"],
             )
-            complete = components_ok and permissions["analysis_status"] == "complete"
+            complete = permissions["analysis_status"] == "complete"
             modules["permission_analysis"] = {"status": "ok" if complete else "partial", "data": permissions}
         except Exception:
             logger.exception("权限详情分析失败")

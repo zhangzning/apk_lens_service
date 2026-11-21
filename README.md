@@ -1,33 +1,48 @@
-# apk_lens_service
+# APK Lens Service
 
-独立的 APK 静态解析 HTTP 服务。上传 APK 后可直接下载 JSON 报告，或下载含报告与解析产物的 ZIP。服务在独立子进程中解析 APK，每个请求使用单独的临时目录，响应结束后清理。结果由调用方保存，服务无数据库依赖。
+独立的 APK 静态解析 HTTP 服务。上传 APK 后可以获取包信息、Manifest 组件、权限和签名证书，也可以下载包含 JADX 反编译产物的 ZIP。支持同步与异步调用，无数据库依赖。
 
-## 本机启动
+## 部署
 
-支持 Linux 和 macOS，需要 Python 3.12 或以上版本。
+在目标机安装 Linux Docker Engine、Compose V2，并启用 cgroup v2。默认包含一个 API 容器和两个独立解析容器。每个解析容器的内存上限为 4 GiB，API 容器的上限为 384 MiB，宿主机还需预留系统自身的内存。以下命令在 Bash 中执行。
 
-```sh
-uv sync
-uv run apk-lens-service
-```
-
-也可使用 `pip install .` 安装，再运行 `apk-lens-service` 或 `python -m apk_lens_service`。默认监听 `127.0.0.1:18086`。在同一实例中，由一个 HTTP 进程统一管理并发上限，各解析阶段启动独立子进程。默认同时处理两个请求，其中最多一个深度解析请求。
-
-## Linux 容器部署
-
-处理外部上传的 APK 时可用 Docker Engine 和 Compose V2 启动隔离部署。先设置 `APK_LENS_SERVICE_TOKEN`，调用时携带该令牌。
+### 从源码启动
 
 ```bash
-read -rsp 'API token: ' APK_LENS_SERVICE_TOKEN
+git clone https://github.com/zhangzning/apk_lens_service.git
+cd apk_lens_service
+read -rsp 'APK Lens token ' APK_LENS_SERVICE_TOKEN
 echo
 export APK_LENS_SERVICE_TOKEN
-docker compose up --build -d
-curl --fail http://127.0.0.1:18086/readyz
+docker compose up --build --wait --wait-timeout 90
+curl -fsS http://127.0.0.1:18086/readyz
 ```
 
-只有 API 容器对外监听，默认仅绑定宿主机的回环地址。API 通过两个独立的 Unix 套接字流式转发请求，每个解析容器同时处理一个任务，整套服务最多同时处理两个任务和一个深度解析任务。API 令牌留在入口容器。解析容器关闭网络，使用非 root 用户、只读根文件系统、Docker 默认 seccomp 配置和 `no-new-privileges`，并去掉所有 Linux capabilities。
+### 使用预构建部署包
 
-每个解析容器默认分配 2 核 CPU 配额、4 GiB 内存和 192 个任务槽位（含线程）。任务空间是独立的 2 GiB `tmpfs`，按容器内存计费，并在写入时执行容量限制。JADX 的缓存与临时文件位于当前任务目录，响应结束后随任务清理。每个解析子进程另有 CPU 时间与单文件大小限制。
+`main` 的 Tests 工作流通过后，会在对应运行的 Artifacts 中提供 `apk-lens-service-linux-amd64`。从外层 ZIP 取出 `tar.gz`，在 Linux AMD64 目标机解包并导入镜像。部署目录只需包内文件，首次启动可离线完成。 [GitHub Actions](https://github.com/zhangzning/apk_lens_service/actions)
+
+```bash
+mkdir -p apk-lens-deploy
+tar -xzf 'apk-lens-service-替换成提交号-linux-amd64.tar.gz' -C apk-lens-deploy
+cd apk-lens-deploy
+docker load --input images.tar
+read -rsp 'APK Lens token ' APK_LENS_SERVICE_TOKEN
+echo
+export APK_LENS_SERVICE_TOKEN
+docker compose --env-file images.env up --no-build --wait --wait-timeout 90
+curl -fsS http://127.0.0.1:18086/readyz
+```
+
+也可在 Linux AMD64 或 ARM64 的构建机运行 `bash scripts/package-compose.sh`，默认打包到 `dist/`。包内包含 API 与 Worker 镜像、`compose.yaml`、镜像版本配置 `images.env` 和本文。目标机架构需与包名一致。
+
+### 运行状态
+
+`/healthz` 检查 API 进程，`/readyz` 检查是否有 Worker 可以接单。启动后预期 `workers.ready` 和 `workers.configured` 均为 2，`tools` 可确认 AAPT2、JADX、Java 和 readelf 是否可用。一个 Worker 离线时，API 会把请求发往另一台可用 Worker。查看状态用 `docker compose ps`，查看日志用 `docker compose logs -f api worker-1 worker-2`，停止用 `docker compose down`。部署包的 Compose 命令均加上 `--env-file images.env`。
+
+API 默认只绑定宿主机 `127.0.0.1:18086`，对外接入可由 HTTPS 网关转发。令牌由部署环境注入，仅 API 容器持有。API 通过两个独立的 Unix 套接字转发请求，默认最多同时处理两个任务，其中最多一个深度解析。解析容器以非 root 用户运行，关闭网络并使用只读根文件系统。Docker 容器日志会轮转。
+
+每个解析容器默认有 2 核 CPU 配额和 192 个任务槽位（含线程）。APK、JADX 缓存和解析产物工作区位于独立的 2 GiB `tmpfs`，计入容器内存。响应完成后清理请求临时目录。每个解析子进程另有 CPU 时间、虚拟地址空间和单文件大小限制。
 
 | Compose 环境变量 | 默认值或用途 |
 | --- | --- |
@@ -44,8 +59,6 @@ curl --fail http://127.0.0.1:18086/readyz
 | `APK_LENS_JOB_TTL_SECONDS` | 异步状态和结果的保留时间，默认在任务结束后保留 900 秒 |
 | `APK_LENS_JOBS_STORAGE_MIB` | API 异步暂存空间的应用配额，默认 2048 MiB |
 
-`GET /readyz` 的 `workers` 字段报告可用解析容器数。一台离线时，API 仍将请求发往可用的容器。
-
 ## 分析模式
 
 | 模式 | 分析内容 | 默认输出 |
@@ -56,23 +69,30 @@ curl --fail http://127.0.0.1:18086/readyz
 
 基础解析使用 Androguard，可通过 Android SDK 的 `aapt2` 补充或降级读取。深度解析需要 `jadx` 和 Java。原生库导出符号需要 `readelf`、`llvm-readelf` 或 `greadelf`。工具可用性见 `GET /readyz`。
 
-## 调用
+Androguard 读不到完整的 Manifest 时，服务用 AAPT2、ApkInspector 的二进制 XML 读取器和环境中的旧版 AAPT 回填组件和权限申请。超过常规读取上限的二进制 Manifest 优先分块读取，`manifest_components_source` 对应为 `axml_stream`。`permission_requests` 保留 `uses-permission`、`uses-permission-sdk-23` 和 `uses-permission-sdk-m` 标签及可读的 `maxSdkVersion`。完整声明仍未读全时，服务用 AAPT2 的权限摘要回填可核实的权限名，并保留 `partial` 状态。
 
-`POST /v1/analyze` 接收 APK 原始字节，默认使用 `standard`。可通过 `profile=basic|standard|deep` 和 `output=json|zip` 选择模式和格式。配置访问令牌后，请求携带 `Authorization: Bearer <token>`。
+权限模块以 Manifest 申请列表是否读全为完成标准，确认没有权限申请时返回空列表。解释无法核实时保留权限原名，`desc` 标为「未知」，`summary.unknown_description_count` 记录数量。补充的 AOSP 定义通过 `definition_reference` 和 `definition_api_level` 标出来源及版本。静态权限结果中的 `grant_state` 为 `not_checked`。签名证书独立于 Manifest 提取，Worker 镜像包含用于兜底的 `apksigner`。
+
+## 同步调用
+
+`POST /v1/analyze` 接收 APK 原始字节，默认使用 `standard`。正文使用 `application/vnd.android.package-archive` 或 `application/octet-stream`。配置访问令牌后，请求携带 `Authorization: Bearer <token>`。
 
 ```sh
 curl --fail-with-body \
+  -H "Authorization: Bearer $APK_LENS_SERVICE_TOKEN" \
   -H 'Content-Type: application/vnd.android.package-archive' \
   --data-binary @sample.apk \
-  'http://127.0.0.1:18086/v1/analyze?filename=sample.apk&profile=standard' \
+  'http://127.0.0.1:18086/v1/analyze?filename=sample.apk&profile=standard&output=json' \
   -o result.json
 ```
+
+HTTP 200 表示返回了报告。报告的 `status=ok` 表示所有请求模块完整，`status=partial` 时可看 `modules.<模块>.status` 与模块告警。接口定义见 `/docs`。
 
 默认返回 APK 条目数 `modules.basic.data.file_count`。传入 `include_file_tree=true` 后，JSON 或 ZIP 内的 `result.json` 会同时包含 `modules.basic.data.file_tree`，其值是按名称排序的 APK 内部路径列表。
 
 应用显示名优先选择简体中文（中国），并在 `modules.basic.data.app_names` 中保留默认名称、通用中文、本地化名称及其来源。报告中的 `modules` 给出各模块的状态，可以区分完整结果与降级结果。
 
-深度模式的 ZIP 包含 `result.json`、可用图标、`jadx/` 和 `reverse/`。若选择 JSON，则仅返回报告和分析摘要。健康检查使用 `GET /healthz`，完整接口定义见 `GET /docs`。
+深度模式的 ZIP 包含 `result.json`、可用图标、`jadx/` 和 `reverse/`。若选择 JSON，则返回报告和分析摘要。
 
 ## 异步分析
 
@@ -83,16 +103,36 @@ curl --fail-with-body \
   -H "Authorization: Bearer $APK_LENS_SERVICE_TOKEN" \
   -H 'Content-Type: application/vnd.android.package-archive' \
   --data-binary @sample.apk \
-  'http://127.0.0.1:18086/v1/jobs?profile=deep'
+  'http://127.0.0.1:18086/v1/jobs?profile=deep&output=zip' \
+  -o job.json
 ```
 
-通过响应的 `status_url` 查询 `queued`、`running`、`succeeded` 或 `failed`。成功后访问 `result_url` 下载 JSON 或 ZIP。失败状态保存错误代码。查询和下载沿用服务的 Bearer 认证，未产出结果时下载接口返回 `409`。
+通过响应的 `status_url` 查询 `queued`、`running`、`succeeded` 或 `failed`。成功后访问 `result_url` 下载结果。失败状态保留错误代码，任务仍未产出结果时下载接口返回 `409`。以下示例使用 `jq` 读取响应中的路径。
+
+```sh
+base_url='http://127.0.0.1:18086'
+curl -fsS -H "Authorization: Bearer $APK_LENS_SERVICE_TOKEN" \
+  "$base_url$(jq -r .status_url job.json)"
+# 查询到 succeeded 后下载
+curl -fsS -H "Authorization: Bearer $APK_LENS_SERVICE_TOKEN" \
+  "$base_url$(jq -r .result_url job.json)" -o result.zip
+```
 
 相同 SHA256、模式、输出格式和文件树选项会复用排队中、运行中或仍在保留期内的成功任务。提交响应的 `reused` 标识复用。异步报告使用 `sample.apk` 作为输入文件名，允许相同内容以不同上传名复用。任务状态为 `succeeded` 表示产物已生成，报告内仍会标记模块是否为 `partial`。
 
-解析期间 worker 连接中断或暂时没有可用 worker 时，任务最多重试一次。重试使用暂存的 APK 与原分析选项，优先选另一台可用 worker。任务结束即清理源 APK。状态与产物按 TTL 清理，API 重启后旧任务返回 `404`，可重新提交。Compose 使用只供 API 访问的暂存卷，服务启动时清理旧任务文件。
+解析期间 Worker 连接中断或暂时没有可用 Worker 时，任务最多重试一次。重试使用暂存的 APK 与原分析选项，优先选另一台可用 Worker。任务结束即清理源 APK，结果在保留期结束后清理。Compose 的异步暂存默认使用仅供 API 访问的磁盘卷 `api-jobs`。API 重启时清理上次的任务文件，旧任务返回 `404`，调用方需要重新提交。
 
 异步解析与同步解析共用并发槽位。默认最多有 6 个未结束的异步任务（含正在上传和解析），最多保留 128 条任务记录。暂存空间需容纳各任务的 APK 和预留结果空间，达到上限时提交接口返回 `503`。
+
+## 常见返回码
+
+| HTTP | 排查项 |
+| --- | --- |
+| `401` | 检查 Bearer 令牌 |
+| `413` | 检查上传大小、ZIP 展开体积、条目数或结果大小。默认上传上限 512 MiB，展开上限 1536 MiB，最多 50,000 条 ZIP 条目 |
+| `415` | 检查 Content-Type 和请求正文是否为 APK 原始字节 |
+| `422` | 检查错误码。常见原因有缺根 Manifest、ZIP 条目路径异常、APK 不可读或包身份未解析 |
+| `503` | 检查并发槽位、异步暂存配额和 Worker 就绪状态。响应提供 `Retry-After` 时按该值重试 |
 
 ## 日志与指标
 
@@ -121,7 +161,16 @@ histogram_quantile(0.95,
 )
 ```
 
-## 配置
+## 本机开发与配置
+
+Linux 和 macOS 可以用 Python 3.12 或以上版本运行。此方式便于开发和调试，外部 Android 工具由本机提供。
+
+```sh
+uv sync --locked
+uv run --locked apk-lens-service
+```
+
+也可用 `pip install .` 安装后运行 `apk-lens-service`。默认监听 `127.0.0.1:18086`。单个 HTTP 进程负责调度，各解析阶段在独立子进程运行。
 
 下表列出常用环境变量。临时目录需预先创建并允许服务账户读写。监听非回环地址时需设置访问令牌。
 
@@ -158,4 +207,4 @@ uv run --locked pytest -q
 python3 tests/compose_integration.py
 ```
 
-第二条命令需要 Linux Docker Engine、cgroup v2 和 Compose V2。测试生成一个小型 APK，验证静态解析、日志关联、指标、容器隔离和资源限额，也验证停掉 worker 后的接单切换、在途任务崩溃重试、结果复用和 worker 自动恢复。测试结束后清理该项目的容器、卷和测试镜像。
+第二条命令需要 Linux Docker Engine、cgroup v2 和 Compose V2。测试现场生成签名 APK，验证标准解析、日志关联、指标、容器隔离和资源限额，也验证 Worker 停止后的接单切换、在途任务重试、结果复用和自动恢复。测试结束后清理测试项目的容器、卷和镜像。

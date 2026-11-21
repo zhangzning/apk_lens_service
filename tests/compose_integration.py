@@ -153,8 +153,19 @@ def build_fixture(stack):
             root = Path(directory)
             manifest = root / "AndroidManifest.xml"
             manifest.write_bytes(sys.stdin.buffer.read())
+            unsigned = root / "unsigned.apk"
+            key = root / "fixture.p12"
             apk = root / "fixture.apk"
-            subprocess.run(["aapt", "package", "-M", str(manifest), "-F", str(apk)], check=True)
+            subprocess.run(["aapt", "package", "-M", str(manifest), "-F", str(unsigned)], check=True)
+            subprocess.run([
+                "keytool", "-genkeypair", "-alias", "fixture", "-keyalg", "RSA", "-keysize", "2048",
+                "-validity", "2", "-dname", "CN=APK Lens Integration Test", "-keystore", str(key),
+                "-storetype", "PKCS12", "-storepass", "fixture-password", "-noprompt",
+            ], check=True, stdout=sys.stderr)
+            subprocess.run([
+                "apksigner", "sign", "--min-sdk-version", "24", "--ks", str(key),
+                "--ks-pass", "pass:fixture-password", "--out", str(apk), str(unsigned),
+            ], check=True, stdout=sys.stderr)
             sys.stdout.buffer.write(apk.read_bytes())
     """, input=MANIFEST)
 
@@ -171,6 +182,23 @@ def verify_request(stack, apk):
     assert report["modules"]["basic"]["data"]["package_name"] == PACKAGE
     assert report["attempts"][0]["duration_ms"] > 0
     return request_id
+
+
+def check_standard_analysis(stack, apk):
+    status, _, body = stack.request(
+        "/v1/analyze?profile=standard", data=apk,
+        headers={"Content-Type": "application/vnd.android.package-archive"},
+    )
+    assert status == 200, body[:300]
+    report = json.loads(body)
+    modules = report["modules"]
+    assert report["status"] == "ok"
+    assert {key: module["status"] for key, module in modules.items()} == {
+        "basic": "ok", "packing": "ok", "permission_analysis": "ok", "certificate": "ok",
+    }
+    assert modules["basic"]["data"]["package_name"] == PACKAGE
+    assert modules["permission_analysis"]["data"]["permissions"] == []
+    assert modules["certificate"]["data"]["fingerprint_sha256"]
 
 
 def check_telemetry(stack, request_id):
@@ -296,7 +324,7 @@ def main():
     if version.returncode or version.stdout.strip() != b"linux 2":
         raise SystemExit("The Compose test needs a running Linux Docker Engine with cgroup v2.")
     try:
-        stack.call("up", "--build", "-d", timeout=600)
+        stack.call("up", "--build", "--wait", "--wait-timeout", "90", timeout=650)
         published = stack.call("port", "api", "18086").decode().strip()
         assert re.fullmatch(r"127\.0\.0\.1:\d+", published), published
         stack.base = "http://" + published
@@ -306,7 +334,8 @@ def main():
         print("Both workers passed runtime isolation and resource-limit checks", flush=True)
         apk = build_fixture(stack)
         check_telemetry(stack, verify_request(stack, apk))
-        print("APK parsing, request correlation and metrics passed", flush=True)
+        check_standard_analysis(stack, apk)
+        print("Signed APK standard analysis, request correlation and metrics passed", flush=True)
         check_recovery(stack, apk)
         print("In-flight job replay, result reuse and worker recovery passed", flush=True)
     except Exception:

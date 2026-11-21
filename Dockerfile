@@ -30,7 +30,7 @@ USER 10001:10001
 
 FROM runtime AS worker
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends aapt binutils default-jre-headless \
+    && apt-get install -y --no-install-recommends aapt apksigner binutils default-jre-headless \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=jadx /opt/jadx /opt/jadx
 COPY apk_lens_service/ /app/apk_lens_service/

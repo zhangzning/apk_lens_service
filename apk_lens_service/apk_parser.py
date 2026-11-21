@@ -10,7 +10,7 @@ import shutil
 import tempfile
 import warnings as py_warnings
 import xml.etree.ElementTree as ET
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -22,6 +22,11 @@ from PIL import Image
 
 from apk_lens_service.apk_names import DISPLAY_LOCALES, Labels, name_fields, read_badging_labels, read_manifest_labels
 from apk_lens_service.config import parse_tools as settings
+from apk_lens_service.manifest import (
+    MAX_MANIFEST_BYTES, declarations, launcher_activity, local_tag, manifest_fields, manifest_requires_streaming,
+    read_binary_manifest, read_legacy_xmltree, read_permission_dump, read_streamed_manifest, read_xmltree,
+    requested_permissions,
+)
 from apk_lens_service.utils import (
     calculate_file_md5,
     dedupe_keep_order,
@@ -43,7 +48,6 @@ AAPT2_MANIFEST_RESOURCE_REF_RE = re.compile(
 )
 AAPT2_FILE_MARKER = " (file) "
 MAX_AAPT2_RESOURCE_OUTPUT_BYTES = 32 * 1024 * 1024
-MAX_METADATA_MANIFEST_BYTES = 32 * 1024 * 1024
 MAX_METADATA_RESOURCES_BYTES = 256 * 1024 * 1024
 MAX_ICON_ARCHIVE_BYTES = 16 * 1024 * 1024
 MAX_ICON_DIMENSION = 4096
@@ -74,7 +78,7 @@ def append_warning(warnings: list[str], message: str) -> None:
 
 
 @contextmanager
-def _aapt2_metadata_view(apk_file: Path, warnings: list[str]):
+def _aapt2_metadata_view(apk_file: Path, warnings: list[str], *, include_resources: bool = True):
     """为 ZIP 偏移畸形 APK 构造一个有界、只读的 aapt2 元数据视图。
 
     某些样本会在 ZIP 中间插入数据，却不修正后续 local-header/CD 偏移。
@@ -87,15 +91,16 @@ def _aapt2_metadata_view(apk_file: Path, warnings: list[str]):
     ZIP bomb。临时文件无论成功失败都会删除。
     """
 
-    metadata_limits = {
-        "AndroidManifest.xml": MAX_METADATA_MANIFEST_BYTES,
-        "resources.arsc": MAX_METADATA_RESOURCES_BYTES,
-    }
+    metadata_limits = {"AndroidManifest.xml": MAX_MANIFEST_BYTES}
+    if include_resources:
+        metadata_limits["resources.arsc"] = MAX_METADATA_RESOURCES_BYTES
     metadata: dict[str, bytes] = {}
     temp_path: Path | None = None
 
     try:
         with ZipFile(apk_file, "r") as source:
+            if sum(entry.filename == "AndroidManifest.xml" for entry in source.infolist()) != 1:
+                raise ValueError("必须存在唯一的 AndroidManifest.xml")
             for archive_name, size_limit in metadata_limits.items():
                 try:
                     info = source.getinfo(archive_name)
@@ -1200,6 +1205,7 @@ def _parse_aapt2_badging(
     stdout: str,
     parser_used: str,
     warnings: list[str],
+    streamed_manifest: ET.Element | None = None,
 ) -> dict | None:
     """解析一次成功的 aapt2 badging 输出，并补取启动 Activity。"""
 
@@ -1231,10 +1237,14 @@ def _parse_aapt2_badging(
         result["icon_candidates"] = icon_candidates
 
     if "main_activity" not in result:
-        result["main_activity"] = _extract_main_activity_from_xmltree(
-            apk_file,
-            aapt2_path=aapt2_path,
-        )
+        package = result.get("package_name", "")
+        if streamed_manifest is not None and package and package == streamed_manifest.get("package"):
+            result["main_activity"] = launcher_activity(streamed_manifest, package)
+        else:
+            result["main_activity"] = _extract_main_activity_from_xmltree(
+                apk_file,
+                aapt2_path=aapt2_path,
+            )
 
     if result:
         for key in (
@@ -1254,7 +1264,9 @@ def _parse_aapt2_badging(
     return result or None
 
 
-def parse_apk_with_aapt2(apk_file: Path, warnings: list[str]) -> dict | None:
+def parse_apk_with_aapt2(
+    apk_file: Path, warnings: list[str], streamed_manifest: ET.Element | None = None,
+) -> dict | None:
     """使用 aapt2 解析 APK 基础信息（androguard 失败时的备用方案）。
 
     aapt2 若因 ZIP 中央目录偏移畸形而拒绝原文件，会再尝试一个只包含
@@ -1277,8 +1289,9 @@ def parse_apk_with_aapt2(apk_file: Path, warnings: list[str]) -> dict | None:
             stdout=stdout,
             parser_used="aapt2",
             warnings=warnings,
+            streamed_manifest=streamed_manifest,
         )
-        if result:
+        if result and streamed_manifest is None:
             append_warning(warnings, "androguard 解析不完整，使用 aapt2 备用解析")
         return result
 
@@ -1324,69 +1337,17 @@ def _extract_main_activity_from_xmltree(
     *,
     aapt2_path: str = "",
 ) -> str:
-    """从 aapt2 xmltree 中提取 main activity，支持 activity-alias（targetActivity）。"""
-
-    executable = aapt2_path or shutil.which(settings.aapt2_bin)
-    if not executable:
+    root, _ = read_xmltree(apk_file, aapt2_path or settings.aapt2_bin)
+    if root is None or not (package := root.get("package", "")):
         return ""
-
-    code, stdout, stderr = run_command(
-        [executable, "dump", "xmltree", str(apk_file), "--file", "AndroidManifest.xml"],
-        timeout=60,
-    )
-    if code != 0:
-        return ""
-
-    lines = stdout.split("\n")
-    candidates: list[str] = []
-
-    _elem_re = re.compile(r":(activity(?:-alias)?)\s*\(line=\d+\)\s*$")
-
-    for i, line in enumerate(lines):
-        if "android.intent.category.LAUNCHER" not in line:
-            continue
-
-        cat_indent = len(line) - len(line.lstrip())
-        activity_name = ""
-        target_activity = ""
-
-        for m in range(i - 1, max(0, i - 80), -1):
-            m_indent = len(lines[m]) - len(lines[m].lstrip())
-            if m_indent >= cat_indent:
-                continue
-            elem_match = _elem_re.search(lines[m])
-            if not elem_match:
-                continue
-            elem_type = elem_match.group(1)
-            for n in range(m, min(m + 30, len(lines))):
-                if "android:name(0x01010003)" in lines[n]:
-                    match = re.search(r'"([^"]+)"', lines[n])
-                    if match and not match.group(1).startswith("android."):
-                        activity_name = match.group(1)
-                if "android:targetActivity(0x01010202)" in lines[n]:
-                    match = re.search(r'"([^"]+)"', lines[n])
-                    if match:
-                        target_activity = match.group(1)
-                if n > m:
-                    n_indent = len(lines[n]) - len(lines[n].lstrip())
-                    if n_indent <= m_indent and _elem_re.search(lines[n]):
-                        break
-            break
-
-        activity = target_activity or activity_name
-        if activity and not activity.startswith("android."):
-            candidates.append(activity)
-
-    unique = list(dict.fromkeys(candidates))
-    real = [a for a in unique if not a.endswith("Icon")]
-    return real[0] if real else (unique[0] if unique else "")
+    return launcher_activity(root, package)
 
 
 def _handle_apkfile_basic_runtime(
     apk_file_path: str,
     *,
     prefer_aapt2: bool = False,
-) -> tuple[dict, APK | None]:
+) -> tuple[dict, APK | None, ET.Element | None]:
     """解析 APK 基础信息并返回 JSON 可序列化字典。
 
     当前字段与 APP_BASIC_INFO 落表场景保持对齐，重点包括：
@@ -1401,6 +1362,17 @@ def _handle_apkfile_basic_runtime(
     apk_md5 = calculate_file_md5(apk_file)
     file_size = apk_file.stat().st_size
     warnings: list[str] = []
+    streamed_manifest = None
+    streamed_package = ""
+    if manifest_requires_streaming(apk_file):
+        streamed_manifest, problem = read_streamed_manifest(apk_file)
+        if streamed_manifest is not None:
+            streamed_package = streamed_manifest.get("package", "").strip()
+            if not streamed_package or streamed_package.startswith(("@", "?")):
+                streamed_manifest = None
+                problem = "流式 Manifest 缺少可读取的包名"
+        if streamed_manifest is None:
+            append_warning(warnings, problem)
 
     parsed_data: dict = {
         "apk_path": str(apk_file.resolve()),
@@ -1434,7 +1406,7 @@ def _handle_apkfile_basic_runtime(
     if prefer_aapt2:
         parsed_data["parser_used"] = "aapt2_forced"
         append_warning(warnings, "Androguard隔离解析超时，已切换aapt2降级模式")
-    else:
+    elif streamed_manifest is None:
         try:
             apk = APK(str(apk_file))
         except Exception as exc:  # noqa: BLE001
@@ -1492,7 +1464,7 @@ def _handle_apkfile_basic_runtime(
         or has_garbled_name
     )
     if need_aapt2_fallback:
-        aapt2_result = parse_apk_with_aapt2(apk_file, warnings)
+        aapt2_result = parse_apk_with_aapt2(apk_file, warnings, streamed_manifest)
         if aapt2_result:
             for key in ("package_name", "version_name", "version_code", "min_sdk_version", "target_sdk_version", "main_activity"):
                 if aapt2_result.get(key) and not parsed_data.get(key):
@@ -1534,6 +1506,19 @@ def _handle_apkfile_basic_runtime(
     ):
         parsed_data[key] = strip_zero_width_joiners(parsed_data.get(key)).strip()
 
+    if streamed_manifest is not None:
+        if parsed_data["package_name"] and parsed_data["package_name"] != streamed_package:
+            append_warning(warnings, "流式 Manifest 的包名与已读取的包名不一致")
+            streamed_manifest = None
+        else:
+            manifest_data, _ = manifest_fields(streamed_manifest)
+            if not parsed_data["package_name"]:
+                parsed_data["package_name"] = streamed_package
+                parsed_data["parser_used"] = "axml_stream"
+            for key in ("version_name", "version_code", "min_sdk_version", "target_sdk_version", "main_activity"):
+                if not parsed_data[key]:
+                    parsed_data[key] = manifest_data.get(key, "")
+
     if not parsed_data["package_name"]:
         parsed_data["parser_used"] = "identity_unresolved"
         append_warning(
@@ -1569,7 +1554,7 @@ def _handle_apkfile_basic_runtime(
     parsed_data["icon_source"] = normalize_text(icon_result.get("icon_source"))
     parsed_data["icon_candidates"] = icon_result.get("icon_candidates", [])
 
-    return parsed_data, apk
+    return parsed_data, apk, streamed_manifest
 
 
 def handle_apkfile_basic(
@@ -1579,7 +1564,7 @@ def handle_apkfile_basic(
 ) -> dict:
     """公开的基础解析入口；运行时 APK 对象不会泄露给 API 调用方。"""
 
-    parsed, _apk = _handle_apkfile_basic_runtime(
+    parsed, _apk, _manifest = _handle_apkfile_basic_runtime(
         apk_file_path,
         prefer_aapt2=prefer_aapt2,
     )
@@ -1606,6 +1591,79 @@ def extract_manifest_components(apk: APK, warnings: list[str]) -> dict:
         "receivers": list(safe_call("receivers", warnings, apk.get_receivers, []) or []),
         "providers": list(safe_call("providers", warnings, apk.get_providers, []) or []),
     }
+
+
+def _set_manifest_declarations(parsed: dict, root) -> None:
+    parsed["manifest_declared_permissions"], complete = declarations(root)
+    parsed["manifest_declared_permissions_status"] = "ready" if complete else "partial"
+
+
+def _recover_manifest_components(
+    apk_file: Path, parsed: dict, warnings: list[str], streamed_manifest: ET.Element | None,
+) -> None:
+    expected = parsed["package_name"]
+    best = None
+    aapt2_reader = ("aapt2", lambda path: read_xmltree(path, settings.aapt2_bin))
+    legacy = (("aapt", read_legacy_xmltree),) if shutil.which("aapt") else ()
+    for temporary_view in (False, True):
+        binary = () if temporary_view else (("apkinspector_axml", read_binary_manifest),)
+        streamed = (
+            (("axml_stream", lambda _: (streamed_manifest, "")),)
+            if not temporary_view and streamed_manifest is not None else ()
+        )
+        readers = (*streamed, aapt2_reader, *binary, *legacy)
+        context = (
+            _aapt2_metadata_view(apk_file, warnings, include_resources=False)
+            if temporary_view else nullcontext(apk_file)
+        )
+        with context as path:
+            if path is None:
+                break
+            for tool, read in readers:
+                source = f"{tool}_metadata_view" if temporary_view else tool
+                root, problem = read(path)
+                if root is None:
+                    append_warning(warnings, f"{source} Manifest 组件解析失败: {problem}")
+                    continue
+                fields, incomplete = manifest_fields(root)
+                package = fields.pop("package_name")
+                if not package or package.startswith(("@", "?")) or (expected and expected != package):
+                    append_warning(warnings, f"{source} Manifest 的包名缺失或与已读取的包名不一致")
+                    continue
+                expected = package
+                definition_rows, definitions_complete = declarations(root)
+                if fields_missing := sorted(incomplete):
+                    append_warning(warnings, f"{source} 未读全 Manifest 字段: {', '.join(fields_missing)}")
+                score = (len(incomplete), not definitions_complete)
+                if best is None or score < best[0]:
+                    best = (score, source, fields, incomplete, definition_rows, definitions_complete)
+                if score == (0, False):
+                    break
+        if best is not None and best[0] == (0, False):
+            break
+    if best is None:
+        return
+    _, source, fields, incomplete, definition_rows, definitions_complete = best
+    package = expected
+    if not parsed["package_name"]:
+        parsed["package_name"] = package
+        parsed["parser_used"] = source
+        parsed["app_names"]["package_name"] = package
+        if not parsed["app_name"]:
+            parsed.update(name_fields({}, package))
+
+    for field in ("version_name", "version_code", "min_sdk_version", "target_sdk_version", "main_activity"):
+        if (value := fields.pop(field, "")) and not parsed.get(field):
+            parsed[field] = value
+    for field, value in fields.items():
+        if field not in incomplete or not parsed.get(field):
+            parsed[field] = value
+    parsed["library"] = ",".join(parsed["libraries"])
+    parsed["manifest_components_source"] = source
+    parsed["manifest_components_status"] = "partial" if incomplete else "ok"
+    parsed["manifest_permission_requests_status"] = "partial" if "permissions" in incomplete else "ok"
+    parsed["manifest_declared_permissions"] = definition_rows
+    parsed["manifest_declared_permissions_status"] = "ready" if definitions_complete else "partial"
 
 
 def extract_apk_file_tree(apk_file: Path, *, include_file_tree: bool = False) -> dict:
@@ -1635,7 +1693,7 @@ def parse_apk_full(
 
     # 基础字段与组件提取复用同一个 Androguard APK 对象。旧实现对同一文件
     # 构造两次 APK，在病理 AXML/资源表上会把最坏耗时和内存放大一倍。
-    parsed, apk = _handle_apkfile_basic_runtime(
+    parsed, apk, streamed_manifest = _handle_apkfile_basic_runtime(
         apk_file_path,
         prefer_aapt2=prefer_aapt2,
     )
@@ -1643,25 +1701,42 @@ def parse_apk_full(
     apk_file = validate_apk_path(apk_file_path)
     warnings = parsed.setdefault("parse_warnings", [])
 
-    # 组件提取（需要 androguard APK 对象）
-    try:
-        if apk is None:
-            raise RuntimeError("Androguard未启用，组件字段使用降级空值")
-        warning_count = len(warnings)
-        components = extract_manifest_components(apk, warnings)
-        parsed.update(components)
-        if len(warnings) != warning_count:
-            parsed["manifest_components_status"] = "partial"
-    except Exception as exc:
-        append_warning(warnings, f"组件解析失败: {exc}")
-        parsed["manifest_components_status"] = "unavailable"
-        parsed.update({
-            "permissions": [],
-            "activities": [],
-            "services": [],
-            "receivers": [],
-            "providers": [],
-        })
+    parsed["manifest_components_source"] = "androguard" if apk is not None else None
+    parsed.update(permissions=[], activities=[], services=[], receivers=[], providers=[])
+    if apk is not None:
+        try:
+            warning_count = len(warnings)
+            parsed.update(extract_manifest_components(apk, warnings))
+            if len(warnings) != warning_count:
+                parsed["manifest_components_status"] = "partial"
+        except Exception as exc:
+            append_warning(warnings, f"组件解析失败: {exc}")
+            parsed["manifest_components_status"] = "unavailable"
+
+    parsed["manifest_permission_requests_status"] = "unavailable"
+    if apk is not None and parsed["manifest_components_status"] == "ok":
+        root = safe_call("AndroidManifest.xml", warnings, apk.get_android_manifest_xml)
+        if root is not None and local_tag(root) == "manifest" and root.get("package") == parsed["package_name"]:
+            names, requests, complete = requested_permissions(root)
+            parsed["permissions"] = names
+            parsed["permission_requests"] = requests
+            parsed["manifest_permission_requests_status"] = "ok" if complete else "partial"
+            _set_manifest_declarations(parsed, root)
+    if parsed["manifest_components_status"] != "ok" or parsed["manifest_permission_requests_status"] != "ok":
+        _recover_manifest_components(apk_file, parsed, warnings, streamed_manifest)
+    if parsed["manifest_permission_requests_status"] != "ok" and parsed["package_name"]:
+        permission_dump = read_permission_dump(apk_file, settings.aapt2_bin)
+        if permission_dump and permission_dump[0] == parsed["package_name"]:
+            _, requested, defined = permission_dump
+            if requested:
+                parsed["permissions"] = list(dict.fromkeys([*parsed["permissions"], *requested]))
+                parsed["manifest_permission_requests_status"] = "partial"
+                parsed["manifest_permission_requests_source"] = "aapt2_permissions"
+                definitions = parsed.setdefault("manifest_declared_permissions", {})
+                for name in defined:
+                    definitions.setdefault(name, {"protectionLevel": None})
+                parsed["manifest_declared_permissions_status"] = "partial"
+                append_warning(warnings, "AAPT2 回填了可读取的权限名，完整声明仍待核验")
 
     parsed.update(extract_apk_file_tree(apk_file, include_file_tree=include_file_tree))
 

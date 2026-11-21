@@ -5,9 +5,50 @@
 
 import hashlib
 import logging
+import re
+import shutil
 from pathlib import Path
 
+from asn1crypto import pem, x509
+
+from apk_lens_service.utils import run_command
+
 logger = logging.getLogger("apk_lens_service.cert_analyzer")
+_VERIFIED_SCHEME = re.compile(r"^Verified using (v[123])(?:\.1)? scheme .*: true$", re.MULTILINE)
+
+
+def _androguard_certificate(apk_path: str) -> tuple[str | None, x509.Certificate | None]:
+    from androguard.core.apk import APK
+
+    # A certificate can be present even when Androguard cannot parse the Manifest.
+    apk = APK(apk_path, skip_analysis=True)
+    for version, read_certificates in (
+        ("v3", apk.get_certificates_v3),
+        ("v2", apk.get_certificates_v2),
+        ("v1", apk.get_certificates_v1),
+    ):
+        for certificate in read_certificates():
+            if certificate is not None:
+                return version, certificate
+    return None, None
+
+
+def _apksigner_certificate(apk_path: str) -> tuple[str | None, x509.Certificate | None]:
+    executable = shutil.which("apksigner")
+    if not executable:
+        return None, None
+    code, output, _ = run_command(
+        [executable, "verify", "--verbose", "--print-certs", "--print-certs-pem", apk_path],
+        timeout=20, capture_limit=1024**2,
+    )
+    if code != 0 or not (versions := _VERIFIED_SCHEME.findall(output)):
+        return None, None
+    if "-----BEGIN CERTIFICATE-----" not in output:
+        return None, None
+    for label, _, der in pem.unarmor(output.encode(), multiple=True):
+        if label == "CERTIFICATE":
+            return max(versions), x509.Certificate.load(der)
+    return None, None
 
 
 def parse_apk_certificate(apk_path: str) -> dict:
@@ -40,39 +81,25 @@ def parse_apk_certificate(apk_path: str) -> dict:
     if not apk_path or not Path(apk_path).exists():
         return result
 
+    version, certificate = None, None
     try:
-        from androguard.core.apk import APK as AndroAPK
+        version, certificate = _androguard_certificate(apk_path)
+    except Exception:
+        logger.info("Androguard 未能读取签名证书", exc_info=True)
+    source = "androguard"
+    if certificate is None:
         try:
-            from loguru import logger as _loguru
-            _loguru.remove()
-        except Exception:
-            pass
+            version, certificate = _apksigner_certificate(apk_path)
+        except (OSError, ValueError, TypeError):
+            logger.info("apksigner 未能读取签名证书", exc_info=True)
+        source = "apksigner"
+    if certificate is None:
+        return result
 
-        apk = AndroAPK(apk_path)
-
-        # 签名版本检测
-        v3 = apk.get_certificates_der_v3() if hasattr(apk, "get_certificates_der_v3") else []
-        v2 = apk.get_certificates_der_v2() if hasattr(apk, "get_certificates_der_v2") else []
-        if v3:
-            result["signature_version"] = "v3"
-            certs = apk.get_certificates_v3()
-        elif v2:
-            result["signature_version"] = "v2"
-            certs = apk.get_certificates_v2()
-        else:
-            certs = apk.get_certificates_v1() if hasattr(apk, "get_certificates_v1") else []
-            if any(certs):
-                result["signature_version"] = "v1"
-
-        certs = [cert for cert in certs if cert is not None]
-        if not certs:
-            result["signature_version"] = None
-            logger.info("证书解析: 未提取到证书对象")
-            return result
-        logger.info("证书解析: certs=%d version=%s", len(certs), result["signature_version"])
-
-        c = certs[0]
-
+    result["signature_version"] = version
+    result["certificate_source"] = source
+    c = certificate
+    try:
         # 颁发者/主题
         logger.info("开始提取证书字段...")
         try:

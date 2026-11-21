@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import unicodedata
 from pathlib import Path
 from typing import Mapping
@@ -25,6 +26,7 @@ def run_command(
     timeout: int = 60,
     *,
     env: Mapping[str, str] | None = None,
+    capture_limit: int | None = None,
 ) -> tuple[int, str, str]:
     """执行外部命令并返回 (returncode, stdout, stderr)。
 
@@ -32,12 +34,28 @@ def run_command(
         command: 命令及参数列表。
         timeout: 超时秒数，默认 60。
         env: 可选的子进程环境变量；未提供时继承当前进程环境。
+        capture_limit: 使用临时区收集输出时，允许读取的单路字节数。
 
     Returns:
         (returncode, stdout, stderr)，stdout/stderr 已 strip。
         returncode=127 表示命令不存在，124 表示超时。
     """
     try:
+        if capture_limit is not None:
+            with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+                completed = subprocess.run(
+                    command, stdout=stdout, stderr=stderr, timeout=timeout,
+                    check=False, env=dict(env) if env is not None else None,
+                )
+                if stdout.tell() > capture_limit or stderr.tell() > capture_limit:
+                    return 125, "", "command output exceeded limit"
+                stdout.seek(0)
+                stderr.seek(0)
+                return (
+                    completed.returncode,
+                    stdout.read().decode("utf-8", errors="replace").strip(),
+                    stderr.read().decode("utf-8", errors="replace").strip(),
+                )
         completed = subprocess.run(
             command,
             capture_output=True,
