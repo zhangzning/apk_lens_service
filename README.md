@@ -88,7 +88,9 @@ curl --fail-with-body \
 
 HTTP 200 表示返回了报告。报告的 `status=ok` 表示所有请求模块完整，`status=partial` 时可看 `modules.<模块>.status` 与模块告警。接口定义见 `/docs`。
 
-默认返回 APK 条目数 `modules.basic.data.file_count`。传入 `include_file_tree=true` 后，JSON 或 ZIP 内的 `result.json` 会同时包含 `modules.basic.data.file_tree`，其值是按名称排序的 APK 内部路径列表。
+默认返回参与解析的条目数 `modules.basic.data.file_count`。传入 `include_file_tree=true` 后，JSON 或 ZIP 内的 `result.json` 会同时包含 `modules.basic.data.file_tree`，其值是按名称排序的条目路径列表。
+
+`standard` 遇到绝对路径 ZIP 条目时，仅从过滤后的临时 ZIP 视图读取 Manifest、资源与其他条目。发生过滤时，`archive_entry_count` 记录原包条目总数，`skipped_absolute_path_entries` 记录跳过数。输入摘要和证书取自原包。原包条目数和声明解压体积仍受上限检查，`deep` 在解包前拒绝绝对路径、父目录跳转、盘符相关的相对路径及符号链接。
 
 应用显示名优先选择简体中文（中国），并在 `modules.basic.data.app_names` 中保留默认名称、通用中文、本地化名称及其来源。报告中的 `modules` 给出各模块的状态，可以区分完整结果与降级结果。
 

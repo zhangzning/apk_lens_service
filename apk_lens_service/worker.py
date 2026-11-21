@@ -4,9 +4,12 @@ import argparse
 import errno
 import logging
 import stat
-from collections.abc import Iterable
+import tempfile
+from collections.abc import Iterable, Iterator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path, PureWindowsPath
-from zipfile import BadZipFile, ZipFile
+from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile, ZipInfo
+from zlib import error as ZlibError
 
 from apk_lens_service.artifacts import AnalysisError, checked_files, encode_report
 from apk_lens_service.config import MAX_APK_ENTRIES, Profile, parse_tools
@@ -15,38 +18,94 @@ from apk_lens_service.worker_limits import apply_process_limits
 logger = logging.getLogger(__name__)
 
 
-def validate_archive(apk: Path, *, byte_limit: int, file_limit: int) -> None:
-    entry_limit = min(file_limit, MAX_APK_ENTRIES)
-    try:
-        with ZipFile(apk) as archive:
-            entries = archive.infolist()
-            if sum(entry.filename == "AndroidManifest.xml" for entry in entries) != 1:
-                raise AnalysisError("INVALID_APK", "APK 必须包含唯一的 AndroidManifest.xml")
-            if len(entries) > entry_limit:
-                raise AnalysisError("APK_EXPANSION_LIMIT", f"APK ZIP 条目数超过上限（{entry_limit:,} 条）")
-            if sum(entry.file_size for entry in entries) > byte_limit:
-                raise AnalysisError("APK_EXPANSION_LIMIT", "APK 解压体积超过上限")
-            for entry in entries:
-                path = entry.filename.replace("\\", "/")
-                if (
-                    path.startswith("/")
-                    or ".." in path.split("/")
-                    or PureWindowsPath(path).drive
-                    or stat.S_ISLNK(entry.external_attr >> 16)
-                ):
-                    raise AnalysisError("INVALID_APK", "APK 包含不安全的条目路径")
-    except (BadZipFile, OSError) as exc:
-        raise AnalysisError("INVALID_APK", "无法读取 APK 容器") from exc
+def _checked_archive_entries(
+    entries: list[ZipInfo], *, byte_limit: int, entry_limit: int, skip_absolute_paths: bool,
+) -> list[ZipInfo]:
+    if sum(entry.filename == "AndroidManifest.xml" for entry in entries) != 1:
+        raise AnalysisError("INVALID_APK", "APK 必须包含唯一的 AndroidManifest.xml")
+    if len(entries) > entry_limit:
+        raise AnalysisError("APK_EXPANSION_LIMIT", f"APK ZIP 条目数超过上限（{entry_limit:,} 条）")
+    if sum(entry.file_size for entry in entries) > byte_limit:
+        raise AnalysisError("APK_EXPANSION_LIMIT", "APK 解压体积超过上限")
+
+    retained = []
+    for entry in entries:
+        path = entry.filename.replace("\\", "/")
+        windows_path = PureWindowsPath(path)
+        is_absolute = path.startswith("/") or windows_path.is_absolute()
+        if (
+            ".." in path.split("/")
+            or (windows_path.drive and not is_absolute)
+            or stat.S_ISLNK(entry.external_attr >> 16)
+            or (is_absolute and not skip_absolute_paths)
+        ):
+            raise AnalysisError("INVALID_APK", "APK 包含不安全的条目路径")
+        if not is_absolute:
+            retained.append(entry)
+    return retained
+
+
+def _write_filtered_archive(source: ZipFile, target: Path, entries: list[ZipInfo]) -> None:
+    with ZipFile(target, "w", compression=ZIP_DEFLATED, compresslevel=1) as filtered:
+        for entry in entries:
+            # Use clean ZIP headers and stream between archives. Entry names
+            # are never used as filesystem paths.
+            if not entry.filename or "\0" in entry.orig_filename:
+                raise AnalysisError("INVALID_APK", "APK 包含无效的 ZIP 条目名称")
+            member = ZipInfo(entry.filename) if entry.compress_type == ZIP_STORED else entry.filename
+            with source.open(entry) as contents, filtered.open(member, "w") as output:
+                remaining = entry.file_size
+                while data := contents.read(64 * 1024):
+                    remaining -= len(data)
+                    if remaining < 0:
+                        raise BadZipFile("ZIP entry exceeded its declared size")
+                    output.write(data)
+                if remaining:
+                    raise BadZipFile("ZIP entry was shorter than its declared size")
+
+
+@contextmanager
+def prepare_archive(
+    apk: Path, *, byte_limit: int, file_limit: int, skip_absolute_paths: bool,
+) -> Iterator[tuple[Path, int, int]]:
+    """Validate the input and create a temporary read-only view only when needed."""
+    with ExitStack() as scratch:
+        view = apk
+        try:
+            with ZipFile(apk) as archive:
+                entries = archive.infolist()
+                entry_count = len(entries)
+                retained = _checked_archive_entries(
+                    entries, byte_limit=byte_limit, entry_limit=min(file_limit, MAX_APK_ENTRIES),
+                    skip_absolute_paths=skip_absolute_paths,
+                )
+                skipped = entry_count - len(retained)
+                if skipped:
+                    directory = scratch.enter_context(tempfile.TemporaryDirectory(prefix="static-apk-", dir=apk.parent))
+                    view = Path(directory) / "filtered.apk"
+                    _write_filtered_archive(archive, view, retained)
+                    view.chmod(0o400)
+        except (BadZipFile, EOFError, RuntimeError, ZlibError) as exc:
+            raise AnalysisError("INVALID_APK", "无法读取 APK 容器") from exc
+        except OSError as exc:
+            if exc.errno in {errno.EFBIG, errno.ENOSPC, errno.EDQUOT}:
+                raise
+            raise AnalysisError("INVALID_APK", "无法读取 APK 容器") from exc
+        # Release the original central directory before the parser opens the view.
+        del archive, entries, retained
+        yield view, entry_count, skipped
 
 
 def analyze_base(
-    apk: Path, profile: Profile, *, prefer_aapt2: bool, include_file_tree: bool
+    apk: Path, profile: Profile, *, prefer_aapt2: bool, include_file_tree: bool,
+    original_apk: Path | None = None,
 ) -> dict:
     from apk_lens_service.apk_parser import parse_apk_full
     from apk_lens_service.packer_detector import quick_packing_check
 
     base = parse_apk_full(
-        str(apk), prefer_aapt2=prefer_aapt2, include_file_tree=include_file_tree
+        str(apk), prefer_aapt2=prefer_aapt2, include_file_tree=include_file_tree,
+        original_apk=original_apk,
     )
     if not base["package_name"]:
         raise AnalysisError("APK_IDENTITY_UNRESOLVED", "无法从 APK 读取包名")
@@ -205,18 +264,27 @@ def main() -> int:
         androguard_logger.remove()
         if args.stage == "certificate":
             result = analyze_certificate(apk)
-        elif args.stage == "deep":
-            result = analyze_deep(
-                apk, args.job_dir / "artifacts",
-                byte_limit=args.max_result_bytes, file_limit=args.max_files,
-            )
         else:
             entry_limit = args.max_apk_entries if args.max_apk_entries is not None else args.max_files
-            validate_archive(apk, byte_limit=args.max_expanded_bytes, file_limit=entry_limit)
-            result = analyze_base(
-                apk, args.profile, prefer_aapt2=args.stage == "aapt2",
-                include_file_tree=args.include_file_tree,
-            )
+            with prepare_archive(
+                apk, byte_limit=args.max_expanded_bytes, file_limit=entry_limit,
+                skip_absolute_paths=args.profile == Profile.STANDARD and args.stage != "deep",
+            ) as (view, entry_count, skipped):
+                if args.stage == "deep":
+                    result = analyze_deep(
+                        apk, args.job_dir / "artifacts",
+                        byte_limit=args.max_result_bytes, file_limit=args.max_files,
+                    )
+                else:
+                    result = analyze_base(
+                        view, args.profile, prefer_aapt2=args.stage == "aapt2",
+                        include_file_tree=args.include_file_tree, original_apk=apk if skipped else None,
+                    )
+                    if skipped:
+                        basic = result["basic"]["data"]
+                        basic["archive_entry_count"] = entry_count
+                        basic["skipped_absolute_path_entries"] = skipped
+                        basic["parse_warnings"].append(f"标准静态解析跳过了 {skipped} 个绝对路径 ZIP 条目")
         payload = encode_report({"modules": result})
     except AnalysisError as exc:
         payload = encode_report({"error": {"code": exc.code, "message": str(exc)}})

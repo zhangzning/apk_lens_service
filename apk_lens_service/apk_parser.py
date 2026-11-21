@@ -1347,6 +1347,7 @@ def _handle_apkfile_basic_runtime(
     apk_file_path: str,
     *,
     prefer_aapt2: bool = False,
+    original_apk: Path | None = None,
 ) -> tuple[dict, APK | None, ET.Element | None]:
     """解析 APK 基础信息并返回 JSON 可序列化字典。
 
@@ -1359,8 +1360,9 @@ def _handle_apkfile_basic_runtime(
     """
 
     apk_file = validate_apk_path(apk_file_path)
-    apk_md5 = calculate_file_md5(apk_file)
-    file_size = apk_file.stat().st_size
+    identity_source = original_apk if original_apk is not None else apk_file
+    apk_md5 = calculate_file_md5(identity_source)
+    file_size = identity_source.stat().st_size
     warnings: list[str] = []
     streamed_manifest = None
     streamed_package = ""
@@ -1684,6 +1686,7 @@ def parse_apk_full(
     *,
     prefer_aapt2: bool = False,
     include_file_tree: bool = False,
+    original_apk: Path | None = None,
 ) -> dict:
     """解析 APK 的基础信息、组件和文件条目。
 
@@ -1696,6 +1699,7 @@ def parse_apk_full(
     parsed, apk, streamed_manifest = _handle_apkfile_basic_runtime(
         apk_file_path,
         prefer_aapt2=prefer_aapt2,
+        original_apk=original_apk,
     )
 
     apk_file = validate_apk_path(apk_file_path)

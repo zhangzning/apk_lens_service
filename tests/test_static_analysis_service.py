@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -86,6 +87,50 @@ def test_apk_entry_limit_reaches_worker_process(tmp_path):
             rejected = await client.post(endpoint, content=over_limit.getvalue(), headers=APK_HEADERS)
             assert rejected.status_code == 413
             assert rejected.json()["detail"]["code"] == "APK_EXPANSION_LIMIT"
+
+    asyncio.run(exercise())
+
+
+def test_standard_analysis_skips_absolute_entries_but_rejects_them_before_unpacking(tmp_path):
+    verify_view = (
+        "from zipfile import ZipFile\n"
+        "with ZipFile(sys.argv[-1]) as view:\n"
+        "    assert view.namelist() == ['AndroidManifest.xml', 'assets/fixture.txt']\n"
+        "    assert view.read('assets/fixture.txt') == b'fixture'"
+    )
+    tool = write_fallback_tool(tmp_path, verify_view)
+    app = create_app(StaticAnalysisSettings(work_dir=tmp_path, aapt2_bin=str(tool)))
+    archive = io.BytesIO(archive_with_unreadable_manifest())
+    with ZipFile(archive, "a") as zipped:
+        zipped.writestr("/fixture/one.bin", b"ignored")
+        zipped.writestr("\\fixture\\two.bin", b"ignored")
+        zipped.writestr("C:/fixture/three.bin", b"ignored")
+    payload = archive.getvalue()
+
+    async def exercise():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://static.test"
+        ) as client:
+            result = await client.post(
+                "/v1/analyze?profile=standard&include_file_tree=true", content=payload, headers=APK_HEADERS
+            )
+            assert result.status_code == 200, result.text
+            report = result.json()
+            data = report["modules"]["basic"]["data"]
+            assert data["package_name"] == "test.static.fixture"
+            assert data["archive_entry_count"] == 5
+            assert data["skipped_absolute_path_entries"] == 3
+            assert data["file_count"] == 2
+            assert data["file_tree"] == ["AndroidManifest.xml", "assets/fixture.txt"]
+            assert report["input"]["md5"] == data["apk_md5"] == hashlib.md5(payload).hexdigest()
+            assert report["input"]["sha256"] == hashlib.sha256(payload).hexdigest()
+            assert data["file_size"] == len(payload)
+            for profile in ("basic", "deep"):
+                rejected = await client.post(
+                    f"/v1/analyze?profile={profile}", content=payload, headers=APK_HEADERS
+                )
+                assert rejected.status_code == 422
+                assert rejected.json()["detail"]["code"] == "INVALID_APK"
 
     asyncio.run(exercise())
 
