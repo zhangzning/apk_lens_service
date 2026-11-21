@@ -129,7 +129,7 @@ curl -fsS -H "Authorization: Bearer $APK_LENS_SERVICE_TOKEN" \
 | HTTP | 排查项 |
 | --- | --- |
 | `401` | 检查 Bearer 令牌 |
-| `413` | 检查上传大小、ZIP 展开体积、条目数或结果大小。默认上传上限 512 MiB，展开上限 1536 MiB，最多 50,000 条 ZIP 条目 |
+| `413` | 检查上传大小、ZIP 展开体积、条目数或结果大小。默认上传上限 512 MiB，展开上限 1536 MiB，APK 最多 200,000 条 ZIP 条目 |
 | `415` | 检查 Content-Type 和请求正文是否为 APK 原始字节 |
 | `422` | 检查错误码。常见原因有缺根 Manifest、ZIP 条目路径异常、APK 不可读或包身份未解析 |
 | `503` | 检查并发槽位、异步暂存配额和 Worker 就绪状态。响应提供 `Retry-After` 时按该值重试 |
@@ -185,7 +185,8 @@ uv run --locked apk-lens-service
 | `APK_LENS_SERVICE_MAX_APK_MIB` | 上传上限，默认 512 MiB |
 | `APK_LENS_SERVICE_MAX_EXPANDED_MIB` | APK 条目展开体积上限，默认 1536 MiB |
 | `APK_LENS_SERVICE_MAX_RESULT_MIB` | 解析产物大小上限，默认 256 MiB |
-| `APK_LENS_SERVICE_MAX_FILES` | 条目数上限，默认 50000 |
+| `APK_LENS_SERVICE_MAX_APK_ENTRIES` | 输入 APK 的 ZIP 条目上限，默认 200,000，可设更低 |
+| `APK_LENS_SERVICE_MAX_FILES` | 解析产物文件数上限，默认 50,000 |
 | `APK_LENS_SERVICE_AAPT2_BIN` | `aapt2` 或其可执行文件路径 |
 | `APK_LENS_SERVICE_JADX_BIN` | `jadx` 或其可执行文件路径 |
 | `APK_LENS_SERVICE_JAVA_HOME` | Java 安装目录。省略时从 `PATH` 查找 |
@@ -198,7 +199,7 @@ uv run --locked apk-lens-service
 | `APK_LENS_SERVICE_MAX_RETAINED_JOBS` | 暂存任务记录上限，默认 128 |
 | `APK_LENS_SERVICE_JOBS_STORAGE_MIB` | 暂存空间应用配额，默认 2048 MiB |
 
-本机模式下三个 `APK_LENS_SERVICE_WORKER_*` 进程限制的默认值均为 0（关闭）。
+如旧配置只显式设置了 `APK_LENS_SERVICE_MAX_FILES`，该值也继续限制 APK ZIP 条目数。两个变量均设定时各自生效。本机模式下三个 `APK_LENS_SERVICE_WORKER_*` 进程限制的默认值均为 0（关闭）。
 
 ## 测试
 

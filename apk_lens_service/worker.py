@@ -9,20 +9,23 @@ from pathlib import Path, PureWindowsPath
 from zipfile import BadZipFile, ZipFile
 
 from apk_lens_service.artifacts import AnalysisError, checked_files, encode_report
-from apk_lens_service.config import Profile, parse_tools
+from apk_lens_service.config import MAX_APK_ENTRIES, Profile, parse_tools
 from apk_lens_service.worker_limits import apply_process_limits
 
 logger = logging.getLogger(__name__)
 
 
 def validate_archive(apk: Path, *, byte_limit: int, file_limit: int) -> None:
+    entry_limit = min(file_limit, MAX_APK_ENTRIES)
     try:
         with ZipFile(apk) as archive:
             entries = archive.infolist()
             if sum(entry.filename == "AndroidManifest.xml" for entry in entries) != 1:
                 raise AnalysisError("INVALID_APK", "APK 必须包含唯一的 AndroidManifest.xml")
-            if len(entries) > file_limit or sum(entry.file_size for entry in entries) > byte_limit:
-                raise AnalysisError("APK_EXPANSION_LIMIT", "APK 解压体积或条目数超过上限")
+            if len(entries) > entry_limit:
+                raise AnalysisError("APK_EXPANSION_LIMIT", f"APK ZIP 条目数超过上限（{entry_limit:,} 条）")
+            if sum(entry.file_size for entry in entries) > byte_limit:
+                raise AnalysisError("APK_EXPANSION_LIMIT", "APK 解压体积超过上限")
             for entry in entries:
                 path = entry.filename.replace("\\", "/")
                 if (
@@ -191,6 +194,7 @@ def main() -> int:
     parser.add_argument("max_expanded_bytes", type=int)
     parser.add_argument("max_result_bytes", type=int)
     parser.add_argument("max_files", type=int)
+    parser.add_argument("--max-apk-entries", type=int)
     parser.add_argument("--include-file-tree", action="store_true")
     args = parser.parse_args()
     apk = args.job_dir / "sample.apk"
@@ -207,7 +211,8 @@ def main() -> int:
                 byte_limit=args.max_result_bytes, file_limit=args.max_files,
             )
         else:
-            validate_archive(apk, byte_limit=args.max_expanded_bytes, file_limit=args.max_files)
+            entry_limit = args.max_apk_entries if args.max_apk_entries is not None else args.max_files
+            validate_archive(apk, byte_limit=args.max_expanded_bytes, file_limit=entry_limit)
             result = analyze_base(
                 apk, args.profile, prefer_aapt2=args.stage == "aapt2",
                 include_file_tree=args.include_file_tree,

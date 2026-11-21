@@ -6,6 +6,8 @@ from pathlib import Path
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+MAX_APK_ENTRIES = 200_000
+
 
 class Profile(StrEnum):
     BASIC = "basic"
@@ -31,8 +33,9 @@ class StaticAnalysisSettings(BaseSettings):
     max_deep_jobs: int = Field(default=1, ge=0, le=8)
     max_apk_mib: int = Field(default=512, ge=1, le=4096)
     max_expanded_mib: int = Field(default=1536, ge=1, le=8192)
+    max_apk_entries: int = Field(default=MAX_APK_ENTRIES, ge=1, le=MAX_APK_ENTRIES)
     max_result_mib: int = Field(default=256, ge=1, le=2048)
-    max_files: int = Field(default=50000, ge=1, le=200000)
+    max_files: int = Field(default=50_000, ge=1, le=200_000)
     upload_timeout: float = Field(default=120, gt=0)
     full_timeout: float = Field(default=180, gt=0)
     fallback_timeout: float = Field(default=120, gt=0)
@@ -51,6 +54,14 @@ class StaticAnalysisSettings(BaseSettings):
     max_pending_jobs: int = Field(default=6, ge=1, le=64)
     max_retained_jobs: int = Field(default=128, ge=1, le=2048)
     jobs_storage_mib: int = Field(default=2048, ge=1, le=65536)
+
+    @model_validator(mode="before")
+    @classmethod
+    def keep_explicit_archive_limits(cls, values):
+        # Older installations could explicitly limit both the APK and the output.
+        if isinstance(values, dict) and "max_files" in values and "max_apk_entries" not in values:
+            return {**values, "max_apk_entries": values["max_files"]}
+        return values
 
     @model_validator(mode="after")
     def check_service_limits(self):

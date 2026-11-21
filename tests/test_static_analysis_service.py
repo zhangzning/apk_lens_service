@@ -14,6 +14,7 @@ from zipfile import ZipFile
 import httpx
 import pytest
 from prometheus_client.parser import text_string_to_metric_families
+from pydantic import ValidationError
 
 from apk_lens_service.api import create_app
 from apk_lens_service.config import StaticAnalysisSettings
@@ -47,6 +48,46 @@ def archive_with_unreadable_manifest() -> bytes:
         archive.writestr("AndroidManifest.xml", b"invalid binary XML")
         archive.writestr("assets/fixture.txt", b"fixture")
     return buffer.getvalue()
+
+
+def test_apk_entry_limit_keeps_output_limit_and_explicit_legacy_limit(monkeypatch):
+    monkeypatch.delenv("APK_LENS_SERVICE_MAX_FILES", raising=False)
+    monkeypatch.delenv("APK_LENS_SERVICE_MAX_APK_ENTRIES", raising=False)
+    defaults = StaticAnalysisSettings()
+    assert (defaults.max_apk_entries, defaults.max_files) == (200_000, 50_000)
+    with pytest.raises(ValidationError, match="max_apk_entries"):
+        StaticAnalysisSettings(max_apk_entries=200_001)
+
+    monkeypatch.setenv("APK_LENS_SERVICE_MAX_FILES", "1000")
+    assert StaticAnalysisSettings().max_apk_entries == 1000
+    monkeypatch.setenv("APK_LENS_SERVICE_MAX_APK_ENTRIES", "2000")
+    separate = StaticAnalysisSettings()
+    assert (separate.max_apk_entries, separate.max_files) == (2000, 1000)
+
+
+def test_apk_entry_limit_reaches_worker_process(tmp_path):
+    tool = write_fallback_tool(tmp_path, "")
+    app = create_app(StaticAnalysisSettings(
+        work_dir=tmp_path, aapt2_bin=str(tool), max_apk_entries=2, max_files=1,
+    ))
+    at_limit = archive_with_unreadable_manifest()
+    over_limit = io.BytesIO(at_limit)
+    with ZipFile(over_limit, "a") as archive:
+        archive.writestr("assets/extra.txt", b"")
+
+    async def exercise():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://static.test"
+        ) as client:
+            endpoint = "/v1/analyze?profile=basic"
+            admitted = await client.post(endpoint, content=at_limit, headers=APK_HEADERS)
+            assert admitted.status_code == 200
+            assert admitted.json()["modules"]["basic"]["data"]["file_count"] == 2
+            rejected = await client.post(endpoint, content=over_limit.getvalue(), headers=APK_HEADERS)
+            assert rejected.status_code == 413
+            assert rejected.json()["detail"]["code"] == "APK_EXPANSION_LIMIT"
+
+    asyncio.run(exercise())
 
 
 def metric_values(text, name, **labels):

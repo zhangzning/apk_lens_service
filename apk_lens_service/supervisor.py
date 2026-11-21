@@ -83,6 +83,7 @@ async def run_stage(
         sys.executable, "-B", "-m", "apk_lens_service.worker",
         stage, profile.value, str(job_dir), str(settings.max_expanded_mib * MIB),
         str(settings.max_result_mib * MIB), str(settings.max_files),
+        "--max-apk-entries", str(settings.max_apk_entries),
     ]
     if include_file_tree:
         command.append("--include-file-tree")
